@@ -16,7 +16,7 @@ from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QPainter, QPen, QS
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame,
                                QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
                                QMessageBox, QPlainTextEdit, QScrollArea, QSizePolicy, QStackedWidget, QVBoxLayout,
-                               QWidget)
+                               QWidget, QInputDialog)
 
 from . import crypto, identity
 from . import fx
@@ -379,21 +379,49 @@ class SettingsDialog(BaseDialog):
         self.host_btn.setText("PARAR SERVIDOR" if self.win.hosting else "INICIAR SERVIDOR")
 
     def export(self):
-        p, _ = QFileDialog.getSaveFileName(self, "Exportar chave", str(Path.home() / f"{self.win.ident.nick}.holo"),
-                                           "Identidade HOLO (*.holo)")
-        if p:
-            Path(p).write_text(self.win.ident.export(), encoding="utf-8")
-            QMessageBox.information(self, "Exportado", "Guarde esse arquivo em lugar seguro: quem tiver ele pode "
-                                                       "falar como voce.")
+        export_key(self, self.win)
 
     def import_(self):
         p, _ = QFileDialog.getOpenFileName(self, "Importar chave", str(Path.home()), "Identidade HOLO (*.holo)")
         if p:
             try:
-                identity.import_identity(Path(p).read_text(encoding="utf-8"))
+                text = Path(p).read_text(encoding="utf-8")
+                pw = None
+                if identity.backup_needs_password(text):
+                    pw, ok = QInputDialog.getText(self, "Importar chave", "Senha do backup:", QLineEdit.Password)
+                    if not ok:
+                        return
+                identity.import_identity(text, pw)
                 QMessageBox.information(self, "Importado", "Chave importada. Reabra o HOLO.")
             except Exception as e:  # noqa: BLE001
                 QMessageBox.warning(self, "Erro", str(e))
+
+
+def export_key(parent, win) -> bool:
+    """Backup da chave com senha. Devolve True se salvou (e marca o backup como feito)."""
+    pw, ok = QInputDialog.getText(parent, "Backup da chave", "Crie uma senha para o backup (minimo 8 caracteres).\n"
+                                  "Sem ela ninguem abre o arquivo, nem voce: anote num lugar seguro.", QLineEdit.Password)
+    if not ok:
+        return False
+    if len(pw) < 8:
+        QMessageBox.warning(parent, "Backup da chave", "A senha precisa ter pelo menos 8 caracteres.")
+        return False
+    pw2, ok = QInputDialog.getText(parent, "Backup da chave", "Digite a senha de novo:", QLineEdit.Password)
+    if not ok:
+        return False
+    if pw2 != pw:
+        QMessageBox.warning(parent, "Backup da chave", "As senhas nao conferem.")
+        return False
+    p, _ = QFileDialog.getSaveFileName(parent, "Salvar backup da chave", str(Path.home() / f"{win.ident.nick}.holo"),
+                                       "Identidade HOLO (*.holo)")
+    if not p:
+        return False
+    Path(p).write_text(win.ident.export(pw), encoding="utf-8")
+    win.store.data["key_backup"] = time.strftime("%Y-%m-%d")
+    win.store.save()
+    QMessageBox.information(parent, "Backup salvo", "Guarde o arquivo e a senha em lugares diferentes (ex.: pendrive e "
+                                                    "gerenciador de senhas). Com eles voce recupera o nick em outro sistema.")
+    return True
 
 
 # ================================================================ janela
@@ -934,6 +962,26 @@ class MainWindow(QMainWindow):
         QApplication.clipboard().clear()
         self.statusBar().showMessage("PANICO: tudo apagado da memoria e da tela", 4000)
 
+    def backup_reminder(self):
+        """Sem backup da chave, o nick se perde ao reinstalar: lembra (no maximo uma vez por semana)."""
+        if self.store.data.get("key_backup"):
+            return
+        last = self.store.data.get("key_backup_reminded", "")
+        if last and time.time() - time.mktime(time.strptime(last, "%Y-%m-%d")) < 7 * 86400:
+            return
+        self.store.data["key_backup_reminded"] = time.strftime("%Y-%m-%d")
+        self.store.save()
+        box = QMessageBox(self)
+        box.setWindowTitle("Backup da chave")
+        box.setText(f"Voce ainda nao fez backup da chave do nick {self.ident.nick}.")
+        box.setInformativeText("Se reinstalar o sistema ou trocar de PC sem o backup, voce perde esse nick para sempre. "
+                               "O backup e um arquivo protegido por senha.")
+        now = box.addButton("FAZER BACKUP AGORA", QMessageBox.AcceptRole)
+        box.addButton("LEMBRAR DEPOIS", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is now:
+            export_key(self, self)
+
     def closeEvent(self, e):
         if self.client:
             self.client.stop()
@@ -958,6 +1006,8 @@ def main(argv=None):
     # visual Cyberpunk (CRT, glitch, inicialização, barra de status); sem a tela de inicialização nas prévias
     fx.install(win, name="ARASAKA HOLO", icon=ASSETS / "arasaka-holo.svg", extra=lambda: [("NET", win.state_lbl.text())], boot=not any(a.startswith("--screenshot=") for a in argv))
     win.show()
+    if not any(a.startswith("--screenshot=") for a in argv):
+        QTimer.singleShot(6000, win.backup_reminder)
     shot = next((a.split("=", 1)[1] for a in argv if a.startswith("--screenshot=")), None)
     if shot:
         QTimer.singleShot(int(next((a.split("=", 1)[1] for a in argv if a.startswith("--delay=")), "3000")),

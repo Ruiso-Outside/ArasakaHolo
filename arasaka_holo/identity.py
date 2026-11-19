@@ -26,6 +26,9 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from nacl import pwhash
+from nacl.exceptions import CryptoError
+from nacl.secret import SecretBox
 from nacl.signing import SigningKey, VerifyKey
 
 APP_ID = "arasaka-holo"
@@ -209,8 +212,17 @@ class Identity:
         return fingerprint(bytes(self.vk))
 
     # export / import (backup da chave para manter o nick depois de reinstalar)
-    def export(self) -> str:
-        return json.dumps({"holo": 1, "nick": self.nick, "sk": base64.b64encode(bytes(self.sk)).decode()})
+    def export(self, password: str | None = None) -> str:
+        """Backup da chave. Com senha (formato 2): Argon2id + XSalsa20-Poly1305; sem senha (formato 1): texto puro."""
+        plain = {"holo": 1, "nick": self.nick, "sk": base64.b64encode(bytes(self.sk)).decode()}
+        if not password:
+            return json.dumps(plain)
+        salt = os.urandom(pwhash.argon2id.SALTBYTES)
+        key = pwhash.argon2id.kdf(SecretBox.KEY_SIZE, password.encode("utf-8"), salt,
+                                  opslimit=pwhash.argon2id.OPSLIMIT_MODERATE, memlimit=pwhash.argon2id.MEMLIMIT_MODERATE)
+        box = SecretBox(key).encrypt(json.dumps(plain).encode("utf-8"))
+        return json.dumps({"holo": 2, "nick": self.nick, "kdf": "argon2id-moderate",
+                           "salt": base64.b64encode(salt).decode(), "box": base64.b64encode(bytes(box)).decode()})
 
     @staticmethod
     def key_path() -> Path:
@@ -255,8 +267,24 @@ def load_identity() -> Identity:
     return Identity(nick, sk, source)
 
 
-def import_identity(text: str) -> Identity:
+def backup_needs_password(text: str) -> bool:
+    try:
+        return json.loads(text).get("holo") == 2
+    except Exception:
+        return False
+
+
+def import_identity(text: str, password: str | None = None) -> Identity:
     d = json.loads(text)
+    if d.get("holo") == 2:
+        if not password:
+            raise ValueError("esse backup tem senha")
+        key = pwhash.argon2id.kdf(SecretBox.KEY_SIZE, password.encode("utf-8"), base64.b64decode(d["salt"]),
+                                  opslimit=pwhash.argon2id.OPSLIMIT_MODERATE, memlimit=pwhash.argon2id.MEMLIMIT_MODERATE)
+        try:
+            d = json.loads(SecretBox(key).decrypt(base64.b64decode(d["box"])).decode("utf-8"))
+        except CryptoError:
+            raise ValueError("senha errada") from None
     if d.get("holo") != 1 or "sk" not in d or "nick" not in d:
         raise ValueError("arquivo de identidade invalido")
     sk = SigningKey(base64.b64decode(d["sk"]))

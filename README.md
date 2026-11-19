@@ -24,8 +24,9 @@ computador:
 
 1. Na primeira conexão, o servidor vincula `nick → sua chave pública`, para sempre.
 2. Outro computador com o mesmo nick é **recusado**. Isso foi testado com um MAC idêntico e outra chave.
-3. **Faça backup da chave** em CONFIG > EXPORTAR CHAVE. Se reinstalar o sistema, importe a chave e o
-   nick continua sendo seu.
+3. **Faça backup da chave** em CONFIG > EXPORTAR CHAVE. O arquivo é protegido por uma senha que você cria
+   (Argon2id + XSalsa20-Poly1305), e o HOLO lembra de fazer o backup enquanto ele não existir. Se reinstalar
+   o sistema, importe a chave com a senha e o nick continua sendo seu.
 
 Para ver seu nick no terminal: `arasaka-holo --nick`.
 
