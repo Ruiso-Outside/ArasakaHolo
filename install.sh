@@ -88,6 +88,17 @@ EOF
   chmod +x "$BIN/$APP_ID"
   mkdir -p "$APPS" "$ICONS"
   cp "$DIR/arasaka_holo/assets/arasaka-holo.svg" "$ICONS/$APP_ID.svg"
+  # Tema de ícones Arasaka (ArasakaZorin): ele tem um ícone "arasaka", e a Área de Trabalho do Zorin (que busca
+  # pelo prefixo do nome) mostraria esse logo no lugar deste. Uma camada do tema na pasta pessoal resolve, sem senha.
+  for th in /usr/share/icons/Arasaka "$HOME/.icons/Arasaka"; do
+    if [ -f "$th/index.theme" ]; then
+      UT="${XDG_DATA_HOME:-$HOME/.local/share}/icons/Arasaka"
+      mkdir -p "$UT/scalable/apps"
+      [ -f "$UT/index.theme" ] || cp "$th/index.theme" "$UT/index.theme"
+      cp "$DIR/arasaka_holo/assets/arasaka-holo.svg" "$UT/scalable/apps/$APP_ID.svg"
+      break
+    fi
+  done
   cat > "$APPS/$APP_ID.desktop" <<EOF
 [Desktop Entry]
 Type=Application

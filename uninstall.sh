@@ -9,7 +9,8 @@ if systemctl --user list-unit-files "$APP_ID-server.service" >/dev/null 2>&1; th
   rm -f "$HOME/.config/systemd/user/$APP_ID-server.service"
 fi
 rm -f "$HOME/.local/bin/$APP_ID" "$HOME/.local/bin/$APP_ID-server" "$APPS/$APP_ID.desktop" \
-      "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps/$APP_ID.svg"
+      "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps/$APP_ID.svg" \
+      "${XDG_DATA_HOME:-$HOME/.local/share}/icons/Arasaka/scalable/apps/$APP_ID.svg"
 rm -rf "$DATA"
 update-desktop-database -q "$APPS" 2>/dev/null
 printf '\e[38;2;227;18;31m ■ ARASAKA HOLO REMOVIDO\e[0m (chave mantida em ~/.config/arasaka-holo)\n'
