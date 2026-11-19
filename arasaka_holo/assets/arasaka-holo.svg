@@ -1,15 +1,19 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
-  <path d="M24 8 H248 V216 L216 248 H8 V24 Z" fill="#070708" stroke="#e3121f" stroke-width="6"/>
-  <path d="M40 44 H216 V160 H120 L84 196 V160 H40 Z" fill="#120406" stroke="#e3121f" stroke-width="6"/>
-  <g transform="translate(92 56) scale(0.072)">
-  <circle cx="500.0" cy="500.0" r="465.4" fill="none" stroke="#e3121f" stroke-width="69.1"/>
-  <circle cx="499.5" cy="244.6" r="155.5" fill="#e3121f"/>
-  <circle cx="243.5" cy="460.6" r="156.0" fill="#e3121f"/>
-  <circle cx="756.5" cy="460.6" r="156.0" fill="#e3121f"/>
-  <rect x="461.7" y="244.6" width="76.6" height="670.6" fill="#e3121f"/>
-  <polygon points="216.4,487.7 472.9,744.2 527.1,690.0 270.6,433.5" fill="#e3121f"/>
-  <polygon points="729.4,433.5 472.9,690.0 527.1,744.2 783.6,487.7" fill="#e3121f"/>
-  
-</g>
-  <rect x="40" y="210" width="90" height="6" fill="#ececf0"/><rect x="138" y="210" width="30" height="6" fill="#e3121f"/>
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="42%" r="70%"><stop offset="0" stop-color="#2a0306"/><stop offset=".55" stop-color="#0d0102"/><stop offset="1" stop-color="#050505"/></radialGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%"><feGaussianBlur stdDeviation="5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    <pattern id="scan" width="4" height="4" patternUnits="userSpaceOnUse"><rect width="4" height="1" fill="#ff1a1a" opacity=".07"/></pattern>
+  </defs>
+  <path d="M24 8 H248 V216 L216 248 H8 V24 Z" fill="url(#bg)"/>
+  <path d="M24 8 H248 V216 L216 248 H8 V24 Z" fill="url(#scan)"/>
+  <path d="M24 8 H248 V216 L216 248 H8 V24 Z" fill="none" stroke="#e3121f" stroke-width="6"/>
+  <path d="M20 30 V20 H30 M226 20 H236 V30 M20 226 V236 H30" fill="none" stroke="#ff3b47" stroke-width="2" opacity=".8"/>
+  <rect x="196" y="226" width="6" height="6" fill="#e3121f"/><rect x="184" y="226" width="6" height="6" fill="#e3121f" opacity=".6"/><rect x="172" y="226" width="6" height="6" fill="#e3121f" opacity=".3"/>
+  <g filter="url(#glow)" fill="none" stroke="#ff1f2d" stroke-linecap="square" stroke-linejoin="miter">
+    <path d="M56 62 H200 V154 H128 L92 186 V154 H56 Z" stroke-width="10"/>
+    <g stroke-width="8"><path d="M80 92 H120 M134 92 H176"/><path d="M80 116 H104 M118 116 H176"/><path d="M80 138 H150"/></g>
+    <ellipse cx="128" cy="212" rx="46" ry="8" stroke-width="5"/>
+    <path d="M96 204 L82 168 M160 204 L174 168" stroke-width="3" opacity=".5"/>
+    <rect x="160" y="132" width="16" height="12" fill="#ff1f2d" stroke="none"/>
+  </g>
 </svg>

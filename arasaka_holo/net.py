@@ -15,9 +15,46 @@ from . import crypto
 from .identity import Identity
 
 
+def normalize_url(url: str) -> str:
+    """Aceita o link como a pessoa colou: https:// vira wss://, http:// vira ws:// e sem esquema vira ws://."""
+    u = (url or "").strip()
+    low = u.lower()
+    if low.startswith("https://"):
+        return "wss://" + u[8:]
+    if low.startswith("http://"):
+        return "ws://" + u[7:]
+    if u and "://" not in u:
+        return "ws://" + u
+    return u
+
+
+def friendly_error(e: Exception) -> str:
+    """Motivo da falha em portugues, para aparecer na tela (e nao so 'OFFLINE')."""
+    name = type(e).__name__
+    txt = str(e)
+    if name == "InvalidURI":
+        return "endereco invalido: use ws://ip:7077 ou wss://dominio"
+    if name == "InvalidStatus":
+        code = getattr(getattr(e, "response", None), "status_code", "")
+        if code == 404:
+            return "esse endereco nao tem um servidor HOLO (HTTP 404): confira o caminho"
+        return f"esse endereco e um site, nao um servidor HOLO (HTTP {code})"
+    if name in ("TimeoutError", "CancelledError") or "timed out" in txt:
+        return "sem resposta: servidor desligado ou porta bloqueada no firewall/roteador"
+    if name == "gaierror" or "Name or service not known" in txt or "getaddrinfo" in txt:
+        return "dominio nao encontrado (DNS)"
+    if isinstance(e, ConnectionRefusedError) or "Connect call failed" in txt or "refused" in txt.lower():
+        return "conexao recusada: nao ha servidor HOLO rodando nessa porta"
+    if name == "SSLCertVerificationError" or "CERTIFICATE_VERIFY_FAILED" in txt:
+        return "certificado TLS invalido no servidor (wss)"
+    if "SSL" in name or "WRONG_VERSION_NUMBER" in txt:
+        return "o servidor nao usa TLS nessa porta: troque wss:// por ws://"
+    return (txt or name)[:160]
+
+
 class HoloClient:
     def __init__(self, url: str, ident: Identity, on_event, proxy: str | None = None):
-        self.url = url
+        self.url = normalize_url(url)
         self.ident = ident
         self.on_event = on_event          # chamado na thread da rede com dicts
         self.proxy = proxy
@@ -99,7 +136,7 @@ class HoloClient:
             except Exception as e:  # noqa: BLE001
                 if self.stop_flag:
                     break
-                self.on_event({"op": "_state", "state": "offline", "error": str(e)[:160]})
+                self.on_event({"op": "_state", "state": "offline", "error": friendly_error(e), "url": self.url})
             self.connected = False
             if self.stop_flag:
                 break

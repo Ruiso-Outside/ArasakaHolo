@@ -19,9 +19,10 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFil
                                QWidget)
 
 from . import crypto, identity
+from . import fx
 from .kit import (FONTS, LINE, MUTED, RED, BaseDialog, CutFrame, HudHeader, Indicator, button, label, load_fonts,
                   logo_pixmap, spaced, stylesheet)
-from .net import HoloClient
+from .net import HoloClient, normalize_url
 
 APP_NAME = "ARASAKA HOLO"
 VERSION = "1.0.0"
@@ -615,6 +616,13 @@ class MainWindow(QMainWindow):
                    "stopped": "DESCONECTADO"}.get(st, st.upper())
             self.state_lbl.setText(txt)
             self.state_lbl.setToolTip(m.get("error", "") or m.get("url", ""))
+            # mostra o motivo uma vez por motivo (sem repetir a cada nova tentativa)
+            err = m.get("error", "")
+            if st == "offline" and err and err != getattr(self, "_last_net_error", ""):
+                self._last_net_error = err
+                self.toast("sem conexao: " + err)
+            elif st == "online":
+                self._last_net_error = ""
         elif op == "welcome":
             self.state_lbl.setText(f"ONLINE · {m.get('online', 1)} NICK(S)")
             self.state_lbl.setToolTip(self.store.data["server"])
@@ -868,8 +876,8 @@ class MainWindow(QMainWindow):
     def settings_dialog(self):
         d = SettingsDialog(self)
         if d.exec() == QDialog.Accepted:
-            changed = d.server.text().strip() != self.store.data["server"]
-            self.store.data["server"] = d.server.text().strip() or DEFAULT_SERVER
+            changed = normalize_url(d.server.text()) != self.store.data["server"]
+            self.store.data["server"] = normalize_url(d.server.text()) or DEFAULT_SERVER
             self.store.data["remember_rooms"] = d.remember.isChecked()
             if not d.remember.isChecked():
                 self.store.data["rooms"] = []
@@ -946,6 +954,8 @@ def main(argv=None):
         store.data["server"] = srv
     ident = identity.load_identity()
     win = MainWindow(ident, store)
+    # visual Cyberpunk (CRT, glitch, inicialização, barra de status); sem a tela de inicialização nas prévias
+    fx.install(win, name="ARASAKA HOLO", icon=ASSETS / "arasaka-holo.svg", extra=lambda: [("NET", win.state_lbl.text())], boot=not any(a.startswith("--screenshot=") for a in argv))
     win.show()
     shot = next((a.split("=", 1)[1] for a in argv if a.startswith("--screenshot=")), None)
     if shot:
