@@ -25,7 +25,7 @@ from .kit import (FONTS, LINE, MUTED, RED, BaseDialog, CutFrame, HudHeader, Indi
 from .net import HoloClient, normalize_url
 
 APP_NAME = "ARASAKA HOLO"
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 ASSETS = Path(__file__).resolve().parent / "assets"
 DEFAULT_SERVER = "https://piphin.online/"  # rede oficial (relay por HTTP no piphin.online)
 LOCAL_SERVER = "ws://127.0.0.1:7077"      # servidor rodando neste PC (CONFIG > INICIAR SERVIDOR)
