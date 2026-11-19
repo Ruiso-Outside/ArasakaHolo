@@ -1,5 +1,5 @@
 """
-ARASAKA HOLO // kit de interface compartilhado (estilo, widgets HUD).
+ARASAKA // kit de interface compartilhado (estilo, widgets HUD).
 """
 from __future__ import annotations
 
