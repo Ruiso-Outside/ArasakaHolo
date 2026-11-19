@@ -25,6 +25,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/home"
           QT_QPA_PLATFORM=offscreen HOME="$RUNNER_TEMP/home" ARASAKA_BLACKWALL_DEMO=1 timeout 120 python -m arasaka_holo --screenshot="$RUNNER_TEMP/tela.png"
           test -s "$RUNNER_TEMP/tela.png"
+      - name: Relay por HTTP (cliente contra a copia do relay PHP)
+        run: timeout 120 python tests/test_http_relay.py
       - uses: actions/upload-artifact@v4
         with:
           name: tela
