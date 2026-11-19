@@ -78,7 +78,7 @@ Para ver seu nick no terminal: `arasaka-holo --nick`.
 
 ## Servidor
 
-O servidor é um "relay cego": só repassa blobs cifrados. Escolha onde ele roda:
+O servidor é um "relay cego": só repassa blobs cifrados. Por padrão o HOLO conecta na **rede oficial**, `https://piphin.online/`. Para usar outro servidor, troque em CONFIG > SERVIDOR. Escolha onde ele roda:
 
 | Onde | Como |
 |---|---|

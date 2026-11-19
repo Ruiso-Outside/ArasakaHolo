@@ -25,9 +25,10 @@ from .kit import (FONTS, LINE, MUTED, RED, BaseDialog, CutFrame, HudHeader, Indi
 from .net import HoloClient, normalize_url
 
 APP_NAME = "ARASAKA HOLO"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 ASSETS = Path(__file__).resolve().parent / "assets"
-DEFAULT_SERVER = "ws://127.0.0.1:7077"
+DEFAULT_SERVER = "wss://piphin.online/"   # rede oficial (https://piphin.online/)
+LOCAL_SERVER = "ws://127.0.0.1:7077"      # servidor rodando neste PC (CONFIG > INICIAR SERVIDOR)
 TTLS = [("sem autodestruicao", 0), ("autodestruir: 30 s", 30), ("autodestruir: 5 min", 300),
         ("autodestruir: 1 h", 3600)]
 NICK_COLORS = ["#ff2e40", "#ececf0", "#ff9e64", "#ff6b9c", "#ffb86b", "#8fc1c4", "#c879ff", "#9fd8b0"]
@@ -908,8 +909,8 @@ class MainWindow(QMainWindow):
         threading.Thread(target=run, daemon=True).start()
         ready.wait(5)
         self.hosting = True
-        if self.store.data["server"] != DEFAULT_SERVER:
-            self.store.data["server"] = DEFAULT_SERVER
+        if self.store.data["server"] != LOCAL_SERVER:
+            self.store.data["server"] = LOCAL_SERVER
             self.store.save()
             self.connect_server()
 
