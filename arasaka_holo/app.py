@@ -11,6 +11,7 @@ import socket
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -21,7 +22,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFil
                                QMessageBox, QPlainTextEdit, QScrollArea, QSizePolicy, QStackedWidget, QVBoxLayout,
                                QWidget, QInputDialog)
 
-from . import calls, crypto, identity
+from . import calls, crypto, diag, identity
 from . import fx
 from .callui import CallManager, clean_ice
 from .kit import (FONTS, LINE, MUTED, RED, BaseDialog, CutFrame, HudHeader, Indicator, button, label, load_fonts,
@@ -30,7 +31,7 @@ from .identity import valid_nick
 from .net import HoloClient, normalize_url
 
 APP_NAME = "ARASAKA HOLO"
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 ASSETS = Path(__file__).resolve().parent / "assets"
 DEFAULT_SERVER = "https://piphin.online/"  # rede oficial (relay por HTTP no piphin.online)
 LOCAL_SERVER = "ws://127.0.0.1:7077"      # servidor rodando neste PC (CONFIG > INICIAR SERVIDOR)
@@ -50,6 +51,7 @@ QPlainTextEdit#composer:focus { border-color: #e3121f; }
 QFrame#msg_me { background: #160609; border-left: 3px solid #e3121f; }
 QFrame#msg_other { background: #0d0d10; border-left: 3px solid #2a2a31; }
 QFrame#msg_warn { background: #1d0a00; border-left: 3px solid #ffb347; }
+QFrame#errbar { background: #1d0a00; border-bottom: 1px solid #ffb347; }
 QFrame#callbar { background: #140407; border-bottom: 1px solid #5a080e; }
 QFrame#topbar { background: #050506; border-bottom: 1px solid #1a0507; }
 """
@@ -461,6 +463,10 @@ class SettingsDialog(BaseDialog):
         il.addLayout(r2)
         right.addWidget(idf)
         right.addStretch()
+        row = QHBoxLayout()
+        row.addWidget(button("DIAGNOSTICAR CONEXAO", None, win.diagnose))
+        row.addStretch()
+        left.insertLayout(left.count() - 1, row)
         self.add_buttons("SALVAR")
 
     def toggle_host(self):
@@ -514,6 +520,54 @@ def export_key(parent, win) -> bool:
     return True
 
 
+class DiagDialog(BaseDialog):
+    """Testa a conexao passo a passo e deixa copiar o relatorio (sem nick, IP ou chave)."""
+    step = Signal(object)
+
+    def __init__(self, win: "MainWindow"):
+        super().__init__(win, "DIAGNOSTICO", "Testa o caminho ate o servidor, passo a passo")
+        self.setMinimumWidth(720)
+        self.win, self.report, self.lines = win, "", []
+        self.out = label("testando...", None, 0.3, 13, wrap=True)
+        self.out.setTextFormat(Qt.RichText)
+        self.out.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.out.setMinimumHeight(260)
+        self.out.setAlignment(Qt.AlignTop)
+        self.lay.addWidget(self.out)
+        row = QHBoxLayout()
+        row.addStretch()
+        self.copy_btn = button("COPIAR RELATORIO", "primary", self.copy)
+        self.copy_btn.setEnabled(False)
+        row.addWidget(self.copy_btn)
+        row.addWidget(button("FECHAR", None, self.accept))
+        self.lay.addLayout(row)
+        self.step.connect(self.on_step)
+        url = win.store.data["server"]
+        self.task = Task(diag.run, url, lambda *a: self.step.emit(a), VERSION)
+        self.task.done.connect(self.on_done)
+        win.tasks.append(self.task)                # a janela pode fechar antes do teste acabar
+        self.task.start()
+
+    def on_step(self, s):
+        ok, name, info = s
+        mark, color = {True: ("✔", "#3ddc84"), False: ("✖", "#ff5560")}.get(ok, ("!", "#ffb347"))
+        self.lines.append(f'<p style="margin:4px 0"><span style="color:{color}">{mark} <b>{esc(name)}</b></span> '
+                          f'<span style="color:#c8c8d0">{esc(info)}</span></p>')
+        self.out.setText("".join(self.lines))
+
+    def on_done(self, r):
+        self.report = f"erro no diagnostico: {r}" if isinstance(r, Exception) else r
+        if isinstance(r, Exception):
+            self.on_step((False, "diagnostico", str(r)))
+        if self.win.last_error:
+            self.report += "\nultimo erro no app: " + self.win.last_error
+        self.copy_btn.setEnabled(True)
+
+    def copy(self):
+        QApplication.clipboard().setText(self.report)
+        self.copy_btn.setText("COPIADO")
+
+
 # ================================================================ janela
 class MainWindow(QMainWindow):
     def __init__(self, ident: identity.Identity, store: Store):
@@ -526,6 +580,7 @@ class MainWindow(QMainWindow):
         self.pending_dm: dict[str, Channel] = {}
         self.tasks: list[Task] = []
         self.replay = crypto.Replay()
+        self.last_error = ""                             # por que nao conectou (fica na tela ate conectar)
         self.ice: list[dict] = []                        # STUN/TURN informados pelo servidor
         self.calls = CallManager(self)
         self.hosting = False
@@ -608,6 +663,18 @@ class MainWindow(QMainWindow):
         self.call_btn.setVisible(False)
         tl.addWidget(self.call_btn)
         cl.addWidget(top)
+        self.err_bar = QFrame()
+        self.err_bar.setObjectName("errbar")
+        el = QHBoxLayout(self.err_bar)
+        el.setContentsMargins(22, 8, 22, 8)
+        self.err_lbl = label("", None, 0.3, 13, wrap=True)
+        self.err_lbl.setStyleSheet("color: #ffb347;")
+        self.err_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        el.addWidget(self.err_lbl, 1)
+        el.addWidget(button("DIAGNOSTICAR", None, self.diagnose, "Testa a conexao passo a passo"))
+        el.addWidget(button("TENTAR DE NOVO", "primary", self.connect_server))
+        self.err_bar.hide()
+        cl.addWidget(self.err_bar)
         cl.addWidget(self.calls.bar)
         self.stack = QStackedWidget()
         self.welcome = self.build_welcome()
@@ -727,10 +794,24 @@ class MainWindow(QMainWindow):
         return False
 
     # ------------------------------------------------------------ conexao
+    def show_error(self, text: str):
+        self.last_error = text
+        self.err_lbl.setText("SEM CONEXAO: " + text if text else "")
+        self.err_bar.setVisible(bool(text))
+
+    def diagnose(self):
+        DiagDialog(self).exec()
+
     def connect_server(self):
-        if self.client:
-            self.client.stop()
-        self.client = HoloClient(self.store.data["server"], self.ident, self.bridge.event.emit)
+        old, self.client = self.client, None
+        if old:                                  # encerrar pode esperar a rede: fora da interface
+            threading.Thread(target=old.stop, daemon=True, name="holo-net-stop").start()
+
+        def emit(ev):                            # avisos atrasados da conexao antiga nao contam
+            if self.client is client:
+                self.bridge.event.emit(ev)
+        client = HoloClient(self.store.data["server"], self.ident, emit)
+        self.client = client
         for ch in self.channels.values():
             if ch.kind == "room":
                 self.client.rooms.add(ch.rid)
@@ -743,17 +824,18 @@ class MainWindow(QMainWindow):
         if op == "_state":
             st = m["state"]
             self.ind.set_ok(st == "online")
-            txt = {"connecting": "CONECTANDO...", "online": "ONLINE", "offline": "OFFLINE · RECONECTANDO",
+            txt = {"connecting": "CONECTANDO...", "login": "ENTRANDO...", "online": "ONLINE", "offline": "OFFLINE · RECONECTANDO",
                    "stopped": "DESCONECTADO"}.get(st, st.upper())
             self.state_lbl.setText(txt)
             self.state_lbl.setToolTip(m.get("error", "") or m.get("url", ""))
-            # mostra o motivo uma vez por motivo (sem repetir a cada nova tentativa)
+            # o motivo fica na barra ate conectar, e aparece uma vez na conversa aberta
             err = m.get("error", "")
-            if st == "offline" and err and err != getattr(self, "_last_net_error", ""):
-                self._last_net_error = err
-                self.toast("sem conexao: " + err)
+            if st == "offline" and err:
+                if err != self.last_error and self.current:
+                    self.toast("sem conexao: " + err)
+                self.show_error(err)
             elif st == "online":
-                self._last_net_error = ""
+                self.show_error("")
         elif op == "welcome":
             plain = is_plain(self.store.data["server"])
             self.state_lbl.setText(f"ONLINE · {m.get('online', 1)} NICK(S)" + (" · SEM TLS" if plain else ""))
@@ -768,6 +850,8 @@ class MainWindow(QMainWindow):
                 self.toast("servidor: " + m["motd"], "#8c8c96")
         elif op == "error":
             code = m.get("code")
+            if code in ("nick_taken", "bad_auth", "bad_sig", "pow", "too_many", "challenge", "tls", "server"):
+                self.show_error(str(m.get("msg") or code))
             if code == "nick_taken":
                 QMessageBox.critical(self, "NICK JA VINCULADO",
                                      f"O nick {self.ident.nick} ja foi registrado neste servidor com outra chave.\n\n"
@@ -1197,6 +1281,36 @@ class MainWindow(QMainWindow):
         e.accept()
 
 
+def install_error_dialog(win: MainWindow):
+    """Erro inesperado: aparece na tela (o app roda sem terminal) e vai para errors.log, so neste PC."""
+    seen: set[str] = set()
+    plain = sys.excepthook
+
+    def hook(kind, e, tb):
+        plain(kind, e, tb)
+        if issubclass(kind, KeyboardInterrupt):
+            return
+        last = traceback.extract_tb(tb)[-1:] if tb else []
+        where = f"{Path(last[0].filename).name}:{last[0].lineno}" if last else "?"
+        text = f"{kind.__name__}: {e}\n{where}"
+        try:
+            log = win.store.dir / "errors.log"
+            if log.exists() and log.stat().st_size > 200_000:
+                log.unlink()
+            # so o tipo e os locais no codigo: o texto do erro poderia conter um pedaco de conversa
+            stack = " < ".join(f"{Path(f.filename).name}:{f.lineno}" for f in reversed(traceback.extract_tb(tb)))
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {VERSION} {kind.__name__} {stack}\n")
+        except OSError:
+            pass
+        if where not in seen:                    # cada erro aparece uma vez: um timer nao pode abrir mil janelas
+            seen.add(where)
+            QTimer.singleShot(0, win, lambda: QMessageBox.warning(
+                win, "Erro no HOLO", f"Aconteceu um erro inesperado (o HOLO continua aberto):\n\n{text[:400]}\n\n"
+                f"Versao {VERSION}. Mande um print desta janela para quem cuida do HOLO."))
+    sys.excepthook = hook
+
+
 def main(argv=None):
     argv = list(sys.argv if argv is None else argv)
     QApplication.setApplicationName("arasaka-holo")
@@ -1217,6 +1331,7 @@ def main(argv=None):
                              "Nada foi alterado. Confira a permissao do arquivo e abra de novo.")
         return 1
     win = MainWindow(ident, store)
+    install_error_dialog(win)
     # visual Cyberpunk (CRT, glitch, inicialização, barra de status); sem a tela de inicialização nas prévias
     fx.install(win, name="ARASAKA HOLO", icon=ASSETS / "arasaka-holo.svg", extra=lambda: [("NET", win.state_lbl.text())], boot=not any(a.startswith("--screenshot=") for a in argv))
     win.show()

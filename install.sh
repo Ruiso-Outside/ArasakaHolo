@@ -62,7 +62,7 @@ step "Ambiente Python"
 mkdir -p "$DATA" "$BIN"
 [ -x "$DATA/venv/bin/python" ] || python3 -m venv "$DATA/venv" || die "falha ao criar o venv"
 "$DATA/venv/bin/python" -m pip install -q --upgrade pip >/dev/null 2>&1
-DEPS=("pynacl>=1.5" "websockets>=14")
+DEPS=("pynacl>=1.5" "websockets>=14" certifi)
 [ "$GUI" -eq 1 ] && DEPS+=("PySide6-Essentials>=6.5")
 "$DATA/venv/bin/python" -m pip install -q --upgrade "${DEPS[@]}" || die "falha ao instalar dependencias"
 ok "libsodium (PyNaCl), websockets$( [ "$GUI" -eq 1 ] && echo ', PySide6')"

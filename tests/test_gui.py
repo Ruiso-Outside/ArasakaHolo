@@ -206,6 +206,47 @@ def main():
     a.input.setPlainText("nao pode sair")
     a.send()
     assert ch.peer_pk == old and "nao pode sair" not in texts(ch), "enviou para chave nao confirmada"
+    # ---------------------------------------------------------------- erro de conexao visivel
+    assert not a.err_bar.isVisible()
+    good = a.store.data["server"]
+    a.store.data["server"] = "http://127.0.0.1:9/"
+    t0 = time.time()
+    a.connect_server()
+    assert time.time() - t0 < 1, "trocar de servidor travou a janela"
+    until(lambda: a.err_bar.isVisible() and "recusada" in a.err_lbl.text(), "motivo na barra")
+    pause(2.5)
+    assert a.err_bar.isVisible(), "o motivo fica ate conectar"
+    shot(a, "erro-conexao")
+    dg = holo.DiagDialog(a)
+    dg.show()
+    until(lambda: dg.copy_btn.isEnabled(), "diagnostico", 40)
+    assert "ERRO" in dg.report and "ultimo erro no app" in dg.report and a.ident.nick not in dg.report, dg.report
+    dg.copy()
+    assert QApplication.clipboard().text() == dg.report
+    shot(dg, "diagnostico-erro")
+    dg.close()
+    a.store.data["server"] = good
+    a.connect_server()
+    until(lambda: a.client.connected and not a.err_bar.isVisible() and "ONLINE" in a.state_lbl.text(), "barra some", 40)
+    pause(4)
+    assert "ONLINE" in a.state_lbl.text(), "aviso atrasado da conexao antiga"
+    a.on_event({"op": "error", "code": "nick_taken", "msg": "este nick ja pertence a outra chave"})
+    assert a.err_bar.isVisible() and "outra chave" in a.err_lbl.text() and "NICK" not in a.state_lbl.toolTip()
+    a.show_error("")
+    hook = sys.excepthook
+    holo.install_error_dialog(a)
+    n = len(BOXES)
+    for _ in range(3):
+        try:
+            raise ValueError("segredo-da-conversa")
+        except ValueError:
+            sys.excepthook(*sys.exc_info())
+    pause(0.3)
+    sys.excepthook = hook
+    assert len(BOXES) == n + 1 and "ValueError" in BOXES[-1], "erro inesperado aparece uma vez"
+    log = (a.store.dir / "errors.log").read_text(encoding="utf-8")
+    assert "ValueError test_gui.py" in log and "segredo" not in log, log
+    print("  erro de conexao, diagnostico e erro inesperado na tela: ok")
     d = holo.SettingsDialog(a)
     d.show()
     shot(d, "config")

@@ -117,6 +117,7 @@ cliente novo recusa servidores antigos. As mensagens da 1.1 também são recusad
 | Autodestruição | escolha o tempo ao lado do campo de mensagem |
 | Call de voz | **CALL** (`Ctrl+K`) na conversa direta ou na sala (até 6 pessoas). `Ctrl+M` liga e desliga o microfone |
 | Compartilhar tela | **TELA** durante a call: escolha o monitor e a qualidade. Os outros clicam em VER TELA (duplo clique: tela cheia) |
+| Não conecta | o motivo fica numa barra no topo. **DIAGNOSTICAR** testa cada passo e copia um relatório sem nick, IP ou chave |
 | Quem pode ligar | CONFIG > CALLS > RECEBER DE (padrão: só quem já conversou com você) |
 
 ## Desinstalar

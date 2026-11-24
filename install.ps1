@@ -36,7 +36,7 @@ New-Item -ItemType Directory -Force -Path $Data, $Bin | Out-Null
 $vpy = Join-Path $Data 'venv\Scripts\python.exe'
 if (-not (Test-Path $vpy)) { & $py -m venv (Join-Path $Data 'venv') }
 & $vpy -m pip install -q --upgrade pip 2>$null | Out-Null
-& $vpy -m pip install -q --upgrade "PySide6-Essentials>=6.5" "pynacl>=1.5" "websockets>=14"
+& $vpy -m pip install -q --upgrade "PySide6-Essentials>=6.5" "pynacl>=1.5" "websockets>=14" certifi
 if ($LASTEXITCODE -ne 0) { throw "falha ao instalar as dependencias" }
 Ok "dependencias instaladas"
 # call e compartilhamento de tela: opcionais (o chat funciona sem elas)
