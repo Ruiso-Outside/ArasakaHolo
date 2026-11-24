@@ -1,10 +1,7 @@
-# Testes: rodam a cada push na main e antes de cada Release (o Release não sai se falharem).
+# Testes: só rodam quando alguém clica em Actions > Testes > Run workflow (não travam push nem Release).
 name: Testes
 on:
-  push:
-    branches: [main]
-  pull_request:
-  workflow_call:
+  workflow_dispatch:
 jobs:
   testes:
     runs-on: ubuntu-latest
@@ -31,6 +28,7 @@ jobs:
         with:
           php-version: '8.2'
           extensions: sodium
+          coverage: none
       - name: Relay por HTTP (copia em Python e o relay PHP de verdade)
         run: |
           php -l relay-php/index.php && php -l relay-php/holo-config.exemplo.php

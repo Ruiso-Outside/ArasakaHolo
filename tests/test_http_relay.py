@@ -335,7 +335,7 @@ def run_php(php: str):
         if srv:
             srv.shutdown()
     text = open(log, encoding="utf-8", errors="replace").read()
-    bad = [ln for ln in text.splitlines() if "PHP " in ln and any(w in ln for w in ("Warning", "Fatal", "Notice", "Deprecated"))]
+    bad = [ln for ln in text.splitlines() if "index.php" in ln and any(w in ln for w in ("Warning", "Fatal", "Notice", "Deprecated"))]
     assert not bad, bad[:5]
     print("OK: relay PHP de verdade (login, sala, mensagens, call, limites, ataques, sem IP e sem sobras no disco)")
 

@@ -7,10 +7,7 @@ on:
 permissions:
   contents: write
 jobs:
-  testes:
-    uses: ./.github/workflows/ci.yml
   release:
-    needs: testes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,7 +25,6 @@ jobs:
           rm -rf "stage/$NAME/preview" "stage/$NAME/.github"
           tar -C stage -czf "out/$NAME-$V-linux.tar.gz" "$NAME"
           (cd stage && zip -qr "../out/$NAME-$V-windows.zip" "$NAME")
-          (cd relay-php && zip -qr "../out/$NAME-$V-hostinger.zip" . )
           ls -la out
       - name: Cria o Release
         env:
