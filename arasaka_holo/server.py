@@ -2,6 +2,7 @@
 ARASAKA HOLO // servidor relay "cego".
 
     python -m arasaka_holo.server [--host 0.0.0.0] [--port 7077] [--data PASTA] [--cert c.pem --key k.pem]
+                                  [--stun stun:host:porta] [--turn turn:host:3478 --turn-secret SEGREDO]
 
 O que o servidor guarda em disco: somente  nick -> chave publica  (e o mes do registro).
 O que fica so na memoria: conexoes abertas e quais ids de sala cada uma ouve.
@@ -13,6 +14,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -21,11 +25,15 @@ import ssl
 import time
 from pathlib import Path
 
-from .crypto import POW_BITS, PROTO, check_auth, pow_ok
-from .identity import NICK_RE
+from .crypto import AUTH, POW_BITS, PROTO, check_auth, host_id, pow_ok
+from .identity import valid_nick
 
 MAX_FRAME = 32 * 1024
 MAX_ROOMS = 64
+MAX_PER_NICK = 8                     # conexoes simultaneas do mesmo nick
+SEND_TIMEOUT = 10                    # s: um cliente travado nao pode segurar a sala inteira
+OPS_N = 120                          # operacoes de qualquer tipo / 10 s por conexao
+DEFAULT_STUN = "stun:stun.cloudflare.com:3478"
 RATE_N, RATE_WINDOW = 30, 10.0       # 30 mensagens / 10 s por conexao
 
 logging.getLogger("websockets").setLevel(logging.ERROR)   # nao registra conexoes / IPs
@@ -52,8 +60,20 @@ class Directory:
         tmp.replace(self.path)
 
 
+def ice_servers(stun: str = DEFAULT_STUN, turn: str = "", secret: str = "", user: str = "", password: str = "",
+                ttl: int = 86400) -> list[dict]:
+    """Servidores que os clientes usam nas calls. Com 'secret' (use-auth-secret do coturn) a credencial expira."""
+    out = [{"urls": [stun]}] if stun else []
+    if turn:
+        if secret:
+            user = f"{int(time.time()) + ttl}:holo"
+            password = base64.b64encode(hmac.new(secret.encode(), user.encode(), hashlib.sha1).digest()).decode()
+        out.append({"urls": [turn], "username": user, "credential": password})
+    return out
+
+
 class Conn:
-    __slots__ = ("ws", "nick", "pk", "rooms", "times")
+    __slots__ = ("ws", "nick", "pk", "rooms", "times", "ops")
 
     def __init__(self, ws):
         self.ws = ws
@@ -61,58 +81,76 @@ class Conn:
         self.pk = ""
         self.rooms: set[str] = set()
         self.times: list[float] = []
+        self.ops: list[float] = []
+
+    @staticmethod
+    def _hit(times: list[float], n: int) -> bool:
+        now = time.monotonic()
+        times[:] = [t for t in times if now - t < RATE_WINDOW]
+        if len(times) >= n:
+            return False
+        times.append(now)
+        return True
 
     def rate_ok(self) -> bool:
-        now = time.monotonic()
-        self.times = [t for t in self.times if now - t < RATE_WINDOW]
-        if len(self.times) >= RATE_N:
-            return False
-        self.times.append(now)
-        return True
+        return self._hit(self.times, RATE_N)
+
+    def ops_ok(self) -> bool:
+        return self._hit(self.ops, OPS_N)
 
 
 class HoloServer:
-    def __init__(self, data_dir: Path, motd: str = ""):
+    def __init__(self, data_dir: Path, motd: str = "", ice=None, public_host: str = "", legacy: bool = True):
         self.dir = Directory(Path(data_dir) / "directory.json")
         self.conns: set[Conn] = set()
         self.by_nick: dict[str, set[Conn]] = {}
         self.rooms: dict[str, set[Conn]] = {}
         self.motd = motd
-        self.started = time.time()
+        self.ice = ice or ice_servers
+        self.public_host = public_host      # atras de proxy que troca o cabecalho Host
+        self.legacy = legacy                # aceita login do HOLO 1.1 (sem o endereco na assinatura)
 
     async def send(self, c: Conn, msg: dict):
         try:
-            await c.ws.send(json.dumps(msg, separators=(",", ":")))
+            await asyncio.wait_for(c.ws.send(json.dumps(msg, separators=(",", ":"))), SEND_TIMEOUT)
+        except asyncio.TimeoutError:
+            c.ws.transport.abort()
         except Exception:
             pass
+
+    async def send_all(self, conns, msg: dict):
+        await asyncio.gather(*(self.send(c, msg) for c in list(conns)))
 
     def members(self, rid: str) -> list[str]:
         return sorted({c.nick for c in self.rooms.get(rid, ())})
 
     async def broadcast_presence(self, rid: str, nick: str, on: bool, skip: Conn | None = None):
-        for o in list(self.rooms.get(rid, ())):
-            if o is not skip:
-                await self.send(o, {"op": "presence", "room": rid, "nick": nick, "on": on,
-                                    "count": len(self.rooms.get(rid, ()))})
+        members = self.rooms.get(rid, set())
+        await self.send_all([o for o in members if o is not skip],
+                            {"op": "presence", "room": rid, "nick": nick, "on": on, "count": len(members)})
 
     async def handler(self, ws):
         c = Conn(ws)
         challenge = secrets.token_hex(16)
         await self.send(c, {"op": "hello", "proto": PROTO, "challenge": challenge, "pow": POW_BITS,
-                            "motd": self.motd})
+                            "motd": self.motd, "auth": AUTH})
         try:
             # ---------------------------------------------------- autenticacao
             raw = await asyncio.wait_for(ws.recv(), timeout=60)
             m = json.loads(raw)
             nick, pk = str(m.get("nick", "")), str(m.get("pk", ""))
-            if m.get("op") != "auth" or not NICK_RE.match(nick) or len(pk) > 64:
+            if m.get("op") != "auth" or not valid_nick(nick) or len(pk) > 64:
                 return await self.send(c, {"op": "error", "code": "bad_auth", "msg": "autenticacao invalida"})
             known = self.dir.get(nick)
             if known and known != pk:
                 return await self.send(c, {"op": "error", "code": "nick_taken",
                                            "msg": "este nick ja pertence a outra chave"})
-            if not check_auth(pk, challenge, nick, str(m.get("sig", ""))):
-                return await self.send(c, {"op": "error", "code": "bad_sig", "msg": "assinatura invalida"})
+            host = host_id(self.public_host or ws.request.headers.get("Host", ""))
+            if not check_auth(pk, challenge, nick, str(m.get("sig", "")), host, self.legacy):
+                return await self.send(c, {"op": "error", "code": "bad_sig", "msg": "assinatura invalida (se o "
+                                           "servidor esta atras de um proxy, use --public-host)"})
+            if len(self.by_nick.get(nick, ())) >= MAX_PER_NICK:
+                return await self.send(c, {"op": "error", "code": "too_many", "msg": "conexoes demais deste nick"})
             new = not known
             if new:
                 if not pow_ok(challenge, nick, pk, int(m.get("pow", -1))):
@@ -121,7 +159,8 @@ class HoloServer:
             c.nick, c.pk = nick, pk
             self.conns.add(c)
             self.by_nick.setdefault(nick, set()).add(c)
-            await self.send(c, {"op": "welcome", "nick": nick, "new": new, "online": len(self.by_nick)})
+            await self.send(c, {"op": "welcome", "nick": nick, "new": new, "online": len(self.by_nick),
+                                "ice": self.ice()})
 
             # ---------------------------------------------------- mensagens
             async for raw in ws:
@@ -132,13 +171,18 @@ class HoloServer:
                     m = json.loads(raw)
                 except ValueError:
                     continue
+                if not isinstance(m, dict):
+                    continue
+                if not c.ops_ok():
+                    await self.send(c, {"op": "error", "code": "rate", "msg": "devagar: limite de operacoes"})
+                    continue
                 op = m.get("op")
                 if op in ("msg", "dm") and not c.rate_ok():
                     await self.send(c, {"op": "error", "code": "rate", "msg": "devagar: limite de mensagens"})
                     continue
                 if op == "join":
                     rid = str(m.get("room", ""))[:64]
-                    if not rid or len(c.rooms) >= MAX_ROOMS:
+                    if not rid or (rid not in c.rooms and len(c.rooms) >= MAX_ROOMS):
                         continue
                     c.rooms.add(rid)
                     self.rooms.setdefault(rid, set()).add(c)
@@ -152,8 +196,7 @@ class HoloServer:
                     if rid not in c.rooms:
                         continue
                     out = {"op": "msg", "room": rid, "blob": str(m.get("blob", ""))}
-                    for o in list(self.rooms.get(rid, ())):
-                        await self.send(o, out)
+                    await self.send_all(self.rooms.get(rid, ()), out)
                 elif op == "dm":
                     to = str(m.get("to", ""))
                     targets = self.by_nick.get(to)
@@ -162,13 +205,14 @@ class HoloServer:
                                             "msg": f"{to} esta offline (nada e guardado no servidor)"})
                         continue
                     out = {"op": "dm", "from": c.nick, "from_pk": c.pk, "blob": str(m.get("blob", ""))}
-                    for o in list(targets):
-                        await self.send(o, out)
+                    await self.send_all(targets, out)
                     await self.send(c, {"op": "dm_ok", "to": to, "ref": m.get("ref")})
                 elif op == "whois":
                     n = str(m.get("nick", ""))
                     await self.send(c, {"op": "whois", "nick": n, "pk": self.dir.get(n),
                                         "online": n in self.by_nick})
+                elif op == "ice":
+                    await self.send(c, {"op": "ice", "servers": self.ice()})
                 elif op == "ping":
                     await self.send(c, {"op": "pong", "t": m.get("t")})
         except (asyncio.TimeoutError, ValueError):
@@ -204,9 +248,10 @@ class HoloServer:
 
 
 async def serve(host: str, port: int, data_dir: Path, cert: str = "", key: str = "", motd: str = "",
-                quiet: bool = False, stop: asyncio.Event | None = None, ready=None):
+                quiet: bool = False, stop: asyncio.Event | None = None, ready=None, ice=None, public_host: str = "",
+                legacy: bool = True):
     from websockets.asyncio.server import serve as ws_serve
-    srv = HoloServer(data_dir, motd)
+    srv = HoloServer(data_dir, motd, ice, public_host, legacy)
     ctx = None
     if cert and key:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -241,9 +286,20 @@ def main():
     ap.add_argument("--cert", default="", help="certificado TLS (para wss://)")
     ap.add_argument("--key", default="", help="chave privada TLS")
     ap.add_argument("--motd", default="", help="mensagem de boas-vindas")
+    ap.add_argument("--public-host", default="", help="endereco que os clientes usam (ex.: chat.exemplo.com), se um "
+                                                      "proxy reverso trocar o cabecalho Host")
+    ap.add_argument("--no-legacy", action="store_true", help="recusa clientes anteriores ao HOLO 1.2")
+    ap.add_argument("--stun", default=DEFAULT_STUN, help="servidor STUN das calls ('' desliga)")
+    ap.add_argument("--turn", default="", help="servidor TURN das calls (ex.: turn:exemplo.com:3478?transport=udp)")
+    ap.add_argument("--turn-secret", default=os.environ.get("HOLO_TURN_SECRET", ""),
+                    help="static-auth-secret do coturn (ou a variavel HOLO_TURN_SECRET)")
+    ap.add_argument("--turn-user", default="")
+    ap.add_argument("--turn-pass", default=os.environ.get("HOLO_TURN_PASS", ""))
     a = ap.parse_args()
     try:
-        asyncio.run(serve(a.host, a.port, Path(a.data), a.cert, a.key, a.motd))
+        asyncio.run(serve(a.host, a.port, Path(a.data), a.cert, a.key, a.motd, public_host=a.public_host,
+                          legacy=not a.no_legacy,
+                          ice=lambda: ice_servers(a.stun, a.turn, a.turn_secret, a.turn_user, a.turn_pass)))
     except KeyboardInterrupt:
         pass
 

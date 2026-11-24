@@ -7,6 +7,9 @@ Nick eterno derivado do MAC da placa de rede fisica:
       -> scrypt(MAC, sal fixo do HOLO)       hash lento: dificulta voltar do nick ao MAC
       -> 32 bytes -> palavra + palavra + 4 hex  ex.: "KuroiRonin-7F3A"
 
+O MAC so decide o nick na PRIMEIRA vez. Depois disso vale a identidade salva: trocar a placa de rede nao muda o
+nick, e uma chave existente nunca e sobrescrita (a anterior vira um arquivo identity-*.key na mesma pasta).
+
 O MAC e publico na rede local, entao ele NAO serve como senha. A posse do
 nick e provada por uma chave Ed25519 gerada aleatoriamente neste computador
 (guardada em ~/.config/arasaka-holo/identity.key). O servidor associa
@@ -23,6 +26,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -144,7 +148,7 @@ def find_nics() -> list[Nic]:
     return [n for n in nics if _usable(n.mac)]
 
 
-def pick_mac(remembered_hash: str = "") -> tuple[str, str]:
+def pick_mac() -> tuple[str, str]:
     """Escolhe o MAC de forma deterministica. Retorna (mac, descricao)."""
     override = os.environ.get("ARASAKA_HOLO_MAC")   # apenas para testes
     if override:
@@ -152,20 +156,10 @@ def pick_mac(remembered_hash: str = "") -> tuple[str, str]:
     nics = find_nics()
     if not nics:
         return "", "nenhuma placa de rede fisica encontrada"
-    if remembered_hash:
-        for n in nics:
-            if mac_hash(n.mac) == remembered_hash:
-                return n.mac, n.name
     # regra fixa: cabeada primeiro, depois endereco de fabrica, depois o menor MAC
     nics.sort(key=lambda n: (not n.wired, not n.permanent, n.mac))
     n = nics[0]
     return n.mac, n.name
-
-
-def mac_hash(mac: str) -> str:
-    """Hash local do MAC (so para lembrar qual placa foi usada; nunca enviado)."""
-    return hashlib.blake2b(bytes.fromhex(mac.replace(":", "")), digest_size=16,
-                           person=b"holo-mac-pick").hexdigest()
 
 
 def nick_from_mac(mac: str) -> str:
@@ -181,7 +175,12 @@ def fingerprint(pk: bytes) -> str:
     return " ".join(h[i:i + 4] for i in range(0, 16, 4))
 
 
-NICK_RE = re.compile(r"^[A-Z][A-Za-z]{2,24}[A-Z][A-Za-z]{1,24}-[0-9A-F]{4}$")
+NICK_RE = re.compile(r"[A-Z][A-Za-z]{2,24}[A-Z][A-Za-z]{1,24}-[0-9A-F]{4}")
+
+
+def valid_nick(nick) -> bool:
+    """fullmatch: '$' aceitaria uma quebra de linha no fim, e o nick pareceria o de outra pessoa."""
+    return isinstance(nick, str) and NICK_RE.fullmatch(nick) is not None
 
 
 # ================================================================ identidade local
@@ -232,38 +231,64 @@ class Identity:
 def _write_private(path: Path, data: str):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(data, encoding="utf-8")
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
+    # ja nasce com 0600 (no Windows, quem protege e a permissao da pasta do usuario)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
     tmp.replace(path)
 
 
-def load_identity() -> Identity:
-    """Carrega (ou cria) a identidade deste computador."""
-    path = Identity.key_path()
-    state = {}
+def _keep_aside(path: Path, tag: str):
+    """Guarda o arquivo da chave com outro nome: uma chave nunca e sobrescrita."""
+    if path.exists():
+        base = f"identity-{tag}-{time.strftime('%Y%m%d-%H%M%S')}"
+        dest, n = path.with_name(base + ".key"), 1
+        while dest.exists():
+            dest, n = path.with_name(f"{base}-{n}.key"), n + 1
+        path.replace(dest)
+
+
+def _read_state(path: Path) -> dict | None:
+    """None = ainda nao existe. {} = existe, mas esta corrompido. Erro de leitura (permissao, disco) sobe."""
     try:
-        state = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except UnicodeDecodeError:
+        return {}
+    try:
+        d = json.loads(raw)
+        if len(base64.b64decode(d["sk"], validate=True)) == 32 and valid_nick(d["nick"]):
+            return d
+    except (ValueError, KeyError, TypeError):
         pass
-    mac, source = pick_mac(state.get("mac_hash", ""))
+    return {}
+
+
+def _store(nick: str, sk: SigningKey):
+    _write_private(Identity.key_path(), json.dumps({"holo": 1, "nick": nick,
+                                                    "sk": base64.b64encode(bytes(sk)).decode()}))
+
+
+def load_identity() -> Identity:
+    """Carrega (ou cria, so na primeira vez) a identidade deste computador."""
+    path = Identity.key_path()
+    state = _read_state(path)
+    if state:
+        return Identity(state["nick"], SigningKey(base64.b64decode(state["sk"])), "salvo neste computador")
+    if state == {}:
+        _keep_aside(path, "corrompida")
+    mac, source = pick_mac()
     if mac:
         nick = nick_from_mac(mac)
-    elif state.get("nick"):
-        nick, source = state["nick"], "salvo (sem placa de rede)"
     else:
         # sem MAC utilizavel: nick aleatorio, salvo para sempre neste perfil
         nick = nick_from_mac(os.urandom(6).hex())
         source = "aleatorio (sem placa de rede fisica)"
-    if state.get("sk") and state.get("nick") == nick:
-        sk = SigningKey(base64.b64decode(state["sk"]))
-    else:
-        sk = SigningKey.generate()
-    state.update({"holo": 1, "nick": nick, "sk": base64.b64encode(bytes(sk)).decode(),
-                  "mac_hash": mac_hash(mac) if mac else ""})
-    _write_private(path, json.dumps(state))
+    sk = SigningKey.generate()
+    _store(nick, sk)
     return Identity(nick, sk, source)
 
 
@@ -285,15 +310,15 @@ def import_identity(text: str, password: str | None = None) -> Identity:
             d = json.loads(SecretBox(key).decrypt(base64.b64decode(d["box"])).decode("utf-8"))
         except CryptoError:
             raise ValueError("senha errada") from None
-    if d.get("holo") != 1 or "sk" not in d or "nick" not in d:
+    if d.get("holo") != 1 or not valid_nick(d.get("nick")):
         raise ValueError("arquivo de identidade invalido")
-    sk = SigningKey(base64.b64decode(d["sk"]))
-    path = Identity.key_path()
-    state = {}
     try:
-        state = json.loads(path.read_text(encoding="utf-8"))
+        sk = SigningKey(base64.b64decode(d["sk"], validate=True))
     except Exception:
-        pass
-    state.update({"holo": 1, "nick": d["nick"], "sk": d["sk"]})
-    _write_private(path, json.dumps(state))
+        raise ValueError("arquivo de identidade invalido") from None
+    path = Identity.key_path()
+    old = _read_state(path)
+    if old is not None and old.get("sk") != d["sk"]:
+        _keep_aside(path, old.get("nick") or "corrompida")
+    _store(d["nick"], sk)
     return Identity(d["nick"], sk, "importado")

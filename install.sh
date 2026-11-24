@@ -48,7 +48,7 @@ fi
 step "Pacotes do sistema"
 PKGS=(python3-venv python3-pip)
 [ "$GUI" -eq 1 ] && PKGS+=(libxcb-cursor0 libxkbcommon-x11-0 libxcb-icccm4 libxcb-keysyms1 libxcb-image0
-                           libxcb-render-util0 libxcb-xinerama0 libxcb-shape0 libegl1)
+                           libxcb-render-util0 libxcb-xinerama0 libxcb-shape0 libegl1 libportaudio2)
 MISSING=()
 for p in "${PKGS[@]}"; do dpkg -s "$p" >/dev/null 2>&1 || MISSING+=("$p"); done
 if [ ${#MISSING[@]} -gt 0 ]; then
@@ -66,6 +66,14 @@ DEPS=("pynacl>=1.5" "websockets>=14")
 [ "$GUI" -eq 1 ] && DEPS+=("PySide6-Essentials>=6.5")
 "$DATA/venv/bin/python" -m pip install -q --upgrade "${DEPS[@]}" || die "falha ao instalar dependencias"
 ok "libsodium (PyNaCl), websockets$( [ "$GUI" -eq 1 ] && echo ', PySide6')"
+
+if [ "$GUI" -eq 1 ]; then   # opcionais: o chat funciona sem elas
+  if "$DATA/venv/bin/python" -m pip install -q --upgrade "aiortc>=1.10" "sounddevice>=0.4.6" "mss>=10" "numpy>=1.26"; then
+    ok "call e compartilhamento de tela"
+  else
+    warn "calls desligadas: precisam do Python 3.10 ou mais novo (o chat funciona normal)"
+  fi
+fi
 
 step "Arquivos"
 rm -rf "$DATA/app"

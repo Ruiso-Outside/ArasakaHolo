@@ -28,6 +28,7 @@ jobs:
           rm -rf "stage/$NAME/preview" "stage/$NAME/.github"
           tar -C stage -czf "out/$NAME-$V-linux.tar.gz" "$NAME"
           (cd stage && zip -qr "../out/$NAME-$V-windows.zip" "$NAME")
+          (cd relay-php && zip -qr "../out/$NAME-$V-hostinger.zip" . )
           ls -la out
       - name: Cria o Release
         env:

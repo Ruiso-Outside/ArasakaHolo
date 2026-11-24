@@ -4,12 +4,15 @@ ARASAKA HOLO // chat (interface PySide6).
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
+import secrets
 import socket
 import sys
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from PySide6.QtCore import QObject, QRectF, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QPainter, QPen, QShortcut
@@ -18,14 +21,16 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFil
                                QMessageBox, QPlainTextEdit, QScrollArea, QSizePolicy, QStackedWidget, QVBoxLayout,
                                QWidget, QInputDialog)
 
-from . import crypto, identity
+from . import calls, crypto, identity
 from . import fx
+from .callui import CallManager, clean_ice
 from .kit import (FONTS, LINE, MUTED, RED, BaseDialog, CutFrame, HudHeader, Indicator, button, label, load_fonts,
                   logo_pixmap, spaced, stylesheet)
+from .identity import valid_nick
 from .net import HoloClient, normalize_url
 
 APP_NAME = "ARASAKA HOLO"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 ASSETS = Path(__file__).resolve().parent / "assets"
 DEFAULT_SERVER = "https://piphin.online/"  # rede oficial (relay por HTTP no piphin.online)
 LOCAL_SERVER = "ws://127.0.0.1:7077"      # servidor rodando neste PC (CONFIG > INICIAR SERVIDOR)
@@ -45,6 +50,7 @@ QPlainTextEdit#composer:focus { border-color: #e3121f; }
 QFrame#msg_me { background: #160609; border-left: 3px solid #e3121f; }
 QFrame#msg_other { background: #0d0d10; border-left: 3px solid #2a2a31; }
 QFrame#msg_warn { background: #1d0a00; border-left: 3px solid #ffb347; }
+QFrame#callbar { background: #140407; border-bottom: 1px solid #5a080e; }
 QFrame#topbar { background: #050506; border-bottom: 1px solid #1a0507; }
 """
 
@@ -75,6 +81,22 @@ def lan_ips() -> list[str]:
     return sorted(i for i in ips if not i.startswith("127."))
 
 
+def is_plain(url: str) -> bool:
+    """Endereco sem TLS fora da propria rede: o servidor continua cego, mas a rede ve nicks e horarios."""
+    if url.lower().startswith(("https://", "wss://")):
+        return False
+    try:
+        host = urlsplit(url).hostname or ""
+        return not ipaddress.ip_address(host).is_private
+    except ValueError:
+        return host not in ("localhost", "")
+
+
+def strong_password() -> str:
+    abc = "abcdefghjkmnpqrstuvwxyz23456789"
+    return "-".join("".join(secrets.choice(abc) for _ in range(5)) for _ in range(4))
+
+
 class Bridge(QObject):
     event = Signal(object)
 
@@ -100,17 +122,19 @@ class Store:
     def __init__(self):
         self.dir = identity.config_dir()
         self.path = self.dir / "settings.json"
-        self.data = {"server": DEFAULT_SERVER, "ttl": 0, "remember_rooms": False, "rooms": [], "pins": {}}
+        self.data = {"server": DEFAULT_SERVER, "ttl": 0, "remember_rooms": False, "rooms": [], "pins": {},
+                     "accept_calls": "known", "hide_ip": False, "mic": "", "speaker": ""}
         try:
             self.data.update(json.loads(self.path.read_text(encoding="utf-8")))
         except Exception:
             pass
+        if not isinstance(self.data.get("pins"), dict):
+            self.data["pins"] = {}
         if self.data.get("server") == "wss://piphin.online/":   # padrao da 1.0.1: a rede oficial agora e por HTTP
             self.data["server"] = DEFAULT_SERVER
 
     def save(self):
-        self.dir.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self.data, indent=1), encoding="utf-8")
+        identity._write_private(self.path, json.dumps(self.data, indent=1))
 
     def pin(self, nick: str, pk: str) -> str:
         """'new' | 'ok' | 'changed'"""
@@ -121,6 +145,10 @@ class Store:
             self.save()
             return "new"
         return "ok" if old == pk else "changed"
+
+    def repin(self, nick: str, pk: str):
+        self.data["pins"][nick] = pk
+        self.save()
 
 
 # ================================================================ widgets
@@ -196,6 +224,10 @@ class MessageWidget(QFrame):
         self.badge = QLabel(badge[0])
         self.badge.setStyleSheet(f"color: {badge[1]}; font-size: 11px;")
         head.addWidget(self.badge)
+        if not crypto.Replay.on_time(body):
+            late = QLabel("⚠ hora fora do normal (relogio errado ou mensagem repetida)")
+            late.setStyleSheet("color: #ffb347; font-size: 11px;")
+            head.addWidget(late)
         head.addStretch()
         self.ttl_lbl = QLabel("")
         self.ttl_lbl.setStyleSheet("color: #ff6b7a; font-size: 11px;")
@@ -224,6 +256,9 @@ class MessageWidget(QFrame):
         if status in ("ok", "new"):
             self.badge.setText("✔ verificado")
             self.badge.setStyleSheet("color: #8c8c96; font-size: 11px;")
+        elif status == "changed":
+            self.badge.setText("⚠ CHAVE DIFERENTE DA CONHECIDA")
+            self.badge.setStyleSheet("color: #ffb347; font-size: 11px;")
         elif status == "mismatch":
             self.badge.setText("⚠ ASSINATURA NAO CONFERE COM O NICK")
             self.badge.setStyleSheet("color: #ff2e40; font-size: 11px;")
@@ -252,7 +287,6 @@ class ChatView(QScrollArea):
         self.lay.setSpacing(8)
         self.lay.addStretch()
         self.setWidget(inner)
-        self.by_id: dict[str, MessageWidget] = {}
 
     def _append(self, w: QWidget):
         self.lay.addWidget(w)
@@ -265,7 +299,6 @@ class ChatView(QScrollArea):
     def add_message(self, body: dict, mine: bool, status: str) -> MessageWidget:
         w = MessageWidget(body, mine, status)
         w.expired.connect(self._expire)
-        self.by_id[body.get("id", str(id(w)))] = w
         self._append(w)
         return w
 
@@ -285,7 +318,6 @@ class ChatView(QScrollArea):
             it = self.lay.takeAt(1)
             if it.widget():
                 it.widget().deleteLater()
-        self.by_id.clear()
 
 
 class Channel:
@@ -295,6 +327,7 @@ class Channel:
         self.rid = crypto.room_id(key) if key else ""
         self.view = ChatView()
         self.members: set[str] = set()
+        self.changed_pk = ""          # chave nova, ainda nao aceita, de um contato que tinha outra
         self.unread = 0
         self.item: QListWidgetItem | None = None
 
@@ -313,11 +346,28 @@ class JoinDialog(BaseDialog):
         self.pw = QLineEdit()
         self.pw.setEchoMode(QLineEdit.Password)
         self.pw.setPlaceholderText("opcional")
-        f.addRow(label("SENHA", "muted", 2, bold=True), self.pw)
+        row = QHBoxLayout()
+        row.addWidget(self.pw, 1)
+        row.addWidget(button("GERAR", None, self.generate, "Cria uma senha forte e copia"))
+        f.addRow(label("SENHA", "muted", 2, bold=True), row)
         self.lay.addLayout(f)
+        self.hint = label("", "red", 0.3, 12, wrap=True)
+        self.pw.textChanged.connect(self.check)
+        self.lay.addWidget(self.hint)
         self.lay.addWidget(label("Sem senha, a sala e publica: quem souber o nome consegue ler. Com senha, so quem "
                                  "tiver a senha le, e nem o servidor sabe o nome da sala.", "muted", 0.3, wrap=True))
         self.add_buttons("ENTRAR")
+
+    def generate(self):
+        pw = strong_password()
+        self.pw.setEchoMode(QLineEdit.Normal)
+        self.pw.setText(pw)
+        QApplication.clipboard().setText(pw)
+        self.hint.setText("Senha copiada: mande para os outros por um meio seguro.")
+
+    def check(self, t: str):
+        self.hint.setText("Senha curta: quem controla o servidor consegue testar senhas comuns. Use 12 caracteres ou "
+                          "mais, ou clique em GERAR." if 0 < len(t) < 12 else "")
 
 
 class DmDialog(BaseDialog):
@@ -335,16 +385,22 @@ class SettingsDialog(BaseDialog):
     def __init__(self, win: "MainWindow"):
         super().__init__(win, "CONFIGURACOES", "Servidor, identidade e privacidade")
         self.win = win
+        self.setMinimumWidth(980)
+        cols, left, right = QHBoxLayout(), QVBoxLayout(), QVBoxLayout()
+        cols.setSpacing(16)
+        cols.addLayout(left, 1)
+        cols.addLayout(right, 1)
+        self.lay.addLayout(cols)
         s = win.store.data
         f = QFormLayout()
         f.setSpacing(10)
         self.server = QLineEdit(s["server"])
         self.server.setPlaceholderText("ws://ip:7077  ou  wss://dominio")
         f.addRow(label("SERVIDOR", "muted", 2, bold=True), self.server)
-        self.remember = QCheckBox("Lembrar as salas neste computador (salva nome e senha em disco)")
+        self.remember = QCheckBox("Lembrar as salas (salva nome e senha em disco)")
         self.remember.setChecked(bool(s.get("remember_rooms")))
         f.addRow("", self.remember)
-        self.lay.addLayout(f)
+        left.addLayout(f)
         host = CutFrame(cut=10)
         hl = QVBoxLayout(host)
         hl.setContentsMargins(16, 12, 16, 12)
@@ -359,21 +415,52 @@ class SettingsDialog(BaseDialog):
         row.addWidget(self.host_btn)
         row.addStretch()
         hl.addLayout(row)
-        self.lay.addWidget(host)
+        left.addWidget(host)
+        left.addStretch()
+        cf = CutFrame(cut=10)
+        kl = QVBoxLayout(cf)
+        kl.setContentsMargins(16, 12, 16, 12)
+        kl.addWidget(label("CALLS", "section", 3))
+        kf = QFormLayout()
+        mics, outs = calls.audio_devices() if calls.available() else ([], [])
+        self.mic, self.spk = QComboBox(), QComboBox()
+        for box, names, cur in ((self.mic, mics, s.get("mic", "")), (self.spk, outs, s.get("speaker", ""))):
+            box.addItem("padrao do sistema", "")
+            for n in names:
+                box.addItem(n, n)
+            box.setCurrentIndex(max(0, box.findData(cur)))
+            box.setMinimumContentsLength(20)
+            box.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        kf.addRow(label("MICROFONE", "muted", 2, bold=True), self.mic)
+        kf.addRow(label("SAIDA", "muted", 2, bold=True), self.spk)
+        self.accept_calls = QComboBox()
+        for t, v in (("contatos que eu ja conheco", "known"), ("qualquer pessoa", "all"), ("ninguem", "none")):
+            self.accept_calls.addItem(t, v)
+        self.accept_calls.setCurrentIndex(max(0, self.accept_calls.findData(s.get("accept_calls", "known"))))
+        kf.addRow(label("RECEBER DE", "muted", 2, bold=True), self.accept_calls)
+        kl.addLayout(kf)
+        self.hide_ip = QCheckBox("Esconder meu IP nas calls (precisa de TURN no servidor)")
+        self.hide_ip.setChecked(bool(s.get("hide_ip")))
+        kl.addWidget(self.hide_ip)
+        if not calls.available():
+            kl.addWidget(label("Calls desligadas: faltam dependencias. Rode o instalador de novo.", "red", 0.3, wrap=True))
+        right.addWidget(cf)
         idf = CutFrame(cut=10)
         il = QVBoxLayout(idf)
         il.setContentsMargins(16, 12, 16, 12)
         il.addWidget(label("IDENTIDADE", "section", 3))
         il.addWidget(label(f"{win.ident.nick}  ·  origem: {win.ident.source}", None, 0.5, bold=True))
-        il.addWidget(label("O nick vem do MAC da placa de rede (o MAC nunca sai do computador). A posse do nick e "
-                           "provada pela sua chave: faca um backup para manter o nick depois de reinstalar.",
+        il.addWidget(label("O nick nasceu do MAC da placa de rede (o MAC nunca sai do computador) e fica salvo aqui. A "
+                           "posse dele e provada pela sua chave: faca um backup para usar o nick em outro PC ou depois "
+                           "de reinstalar.",
                            "muted", 0.3, wrap=True))
         r2 = QHBoxLayout()
         r2.addWidget(button("EXPORTAR CHAVE", None, self.export))
         r2.addWidget(button("IMPORTAR CHAVE", None, self.import_))
         r2.addStretch()
         il.addLayout(r2)
-        self.lay.addWidget(idf)
+        right.addWidget(idf)
+        right.addStretch()
         self.add_buttons("SALVAR")
 
     def toggle_host(self):
@@ -394,7 +481,8 @@ class SettingsDialog(BaseDialog):
                     if not ok:
                         return
                 identity.import_identity(text, pw)
-                QMessageBox.information(self, "Importado", "Chave importada. Reabra o HOLO.")
+                QMessageBox.information(self, "Importado", "Chave importada. Reabra o HOLO para usar esse nick.\n"
+                                        "A chave anterior foi guardada na pasta de configuracao.")
             except Exception as e:  # noqa: BLE001
                 QMessageBox.warning(self, "Erro", str(e))
 
@@ -437,6 +525,9 @@ class MainWindow(QMainWindow):
         self.pending_verify: dict[str, list] = {}
         self.pending_dm: dict[str, Channel] = {}
         self.tasks: list[Task] = []
+        self.replay = crypto.Replay()
+        self.ice: list[dict] = []                        # STUN/TURN informados pelo servidor
+        self.calls = CallManager(self)
         self.hosting = False
         self.host_stop = None
         self.host_loop = None
@@ -510,9 +601,14 @@ class MainWindow(QMainWindow):
         self.lock = label("", "red", 2, 11, True)
         tl.addWidget(self.lock)
         tl.addStretch()
-        self.e2e = label("■ PONTA A PONTA  ·  SERVIDOR CEGO  ·  SEM HISTORICO", "muted", 2, 11, True)
+        self.e2e = label("■ PONTA A PONTA  ·  SEM HISTORICO", "muted", 2, 11, True)
         tl.addWidget(self.e2e)
+        tl.addSpacing(10)
+        self.call_btn = button("CALL", "primary", self.calls.call, "Call de voz com compartilhamento de tela (Ctrl+K)")
+        self.call_btn.setVisible(False)
+        tl.addWidget(self.call_btn)
         cl.addWidget(top)
+        cl.addWidget(self.calls.bar)
         self.stack = QStackedWidget()
         self.welcome = self.build_welcome()
         self.stack.addWidget(self.welcome)
@@ -569,6 +665,8 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+J"), self, self.join_dialog)
         QShortcut(QKeySequence("Ctrl+D"), self, self.dm_dialog)
         QShortcut(QKeySequence("Ctrl+Shift+X"), self, self.panic)
+        QShortcut(QKeySequence("Ctrl+K"), self, self.calls.call)
+        QShortcut(QKeySequence("Ctrl+M"), self, self.calls.toggle_mute)
 
         # ---------------------------------------------------- rede
         self.bridge = Bridge()
@@ -640,6 +738,8 @@ class MainWindow(QMainWindow):
 
     def on_event(self, m: dict):
         op = m.get("op")
+        if isinstance(op, str) and op.startswith("call_"):
+            return self.calls.on_event(m)
         if op == "_state":
             st = m["state"]
             self.ind.set_ok(st == "online")
@@ -655,8 +755,13 @@ class MainWindow(QMainWindow):
             elif st == "online":
                 self._last_net_error = ""
         elif op == "welcome":
-            self.state_lbl.setText(f"ONLINE · {m.get('online', 1)} NICK(S)")
-            self.state_lbl.setToolTip(self.store.data["server"])
+            plain = is_plain(self.store.data["server"])
+            self.state_lbl.setText(f"ONLINE · {m.get('online', 1)} NICK(S)" + (" · SEM TLS" if plain else ""))
+            self.state_lbl.setToolTip(self.store.data["server"] + ("\nSem TLS: a rede no caminho ve nicks e horarios "
+                                                                   "(nao o conteudo)." if plain else ""))
+            self.ice = clean_ice(m.get("ice"))
+            for nick in self.pending_verify:              # perguntas que se perderam na queda da conexao
+                self.client.send({"op": "whois", "nick": nick})
             if m.get("new"):
                 self.toast(f"nick {self.ident.nick} registrado e vinculado a sua chave", "#ececf0")
             if m.get("motd"):
@@ -677,12 +782,14 @@ class MainWindow(QMainWindow):
         elif op == "joined":
             ch = self.room_by_rid(m["room"])
             if ch:
-                ch.members = set(m.get("members", []))
+                ch.members = {n for n in m.get("members", []) if valid_nick(n)}
                 self.refresh_members()
         elif op == "presence":
             ch = self.room_by_rid(m["room"])
-            if ch:
+            if ch and valid_nick(m.get("nick")):
                 (ch.members.add if m["on"] else ch.members.discard)(m["nick"])
+                if not m["on"]:
+                    self.calls.left_room(ch, m["nick"])
                 ch.view.add_system(f"{m['nick']} {'entrou' if m['on'] else 'saiu'}", "#55555e")
                 self.refresh_members()
         elif op == "msg":
@@ -691,6 +798,8 @@ class MainWindow(QMainWindow):
             self.on_dm(m)
         elif op == "whois":
             self.on_whois(m)
+        elif op == "ice":
+            self.ice = clean_ice(m.get("servers"))
 
     def room_by_rid(self, rid: str) -> Channel | None:
         return self.channels.get("room:" + rid)
@@ -703,31 +812,42 @@ class MainWindow(QMainWindow):
             return "ok" if k == self.ident.pk_b64 else "mismatch"
         known = self.directory.get(nick, "?")
         if known == "?":
-            self.client.send({"op": "whois", "nick": nick})
+            if nick not in self.pending_verify:
+                self.client.send({"op": "whois", "nick": nick})
             return "pending"
         if known != k:
             return "mismatch"
         return self.store.pin(nick, k)
 
     def on_whois(self, m: dict):
-        nick, pk = m["nick"], m.get("pk")
+        nick, pk = m.get("nick"), m.get("pk")
+        if not valid_nick(nick):
+            return
+        if not crypto.valid_pk(pk):
+            pk = None
         self.directory[nick] = pk
-        for body, w in self.pending_verify.pop(nick, []):
+        for body, w, rch in self.pending_verify.pop(nick, []):
+            status = "mismatch" if pk != body["k"] else self.store.pin(nick, pk)
+            if w is None:                                 # sinalizacao de call da sala
+                if status in ("ok", "new") and self.channels.get(rch.cid) is rch:
+                    self.calls.on_room(rch, body)
+                continue
             try:
-                w.set_status("mismatch" if pk != body["k"] else ("ok" if self.store.pin(nick, pk) != "changed"
-                                                                  else "mismatch"))
-            except RuntimeError:
+                w.set_status(status)
+            except RuntimeError:                          # a mensagem ja sumiu da tela
                 pass
         ch = self.pending_dm.pop(nick, None)
         if ch:
             if not pk:
                 ch.view.add_system(f"{nick} nao existe neste servidor", "#ff2e40")
             else:
-                ch.peer_pk = pk
-                pin = self.store.pin(nick, pk)
-                if pin == "changed":
+                if self.store.pin(nick, pk) == "changed":
+                    ch.peer_pk, ch.changed_pk = self.store.data["pins"][nick], pk
                     ch.view.add_system(f"ATENCAO: a chave de {nick} mudou desde a ultima conversa. Pode ser outra "
-                                       "pessoa ou um servidor malicioso.", "#ffb347")
+                                       "pessoa ou um servidor malicioso. Nada sera enviado sem voce confirmar.",
+                                       "#ffb347")
+                else:
+                    ch.peer_pk = pk
                 ch.view.add_system(f"chave de {nick}: {identity.fingerprint(crypto.ub64(pk))}  ·  "
                                    f"{'online' if m.get('online') else 'offline'}", "#8c8c96")
             if ch is self.current:
@@ -771,13 +891,27 @@ class MainWindow(QMainWindow):
         ch = self.room_by_rid(m["room"])
         if not ch:
             return
-        body = crypto.open_room(ch.key, m["blob"])
+        try:
+            body = crypto.open_room(ch.key, m.get("blob", ""))
+        except crypto.OldMessage as e:
+            return ch.view.add_system(f"{e.nick} usa uma versao antiga do HOLO: mensagem recusada (peca para atualizar)",
+                                      "#ffb347")
         if not body:
             return ch.view.add_system("mensagem que nao abre com esta chave (descartada)", "#ffb347")
+        if not self.replay.fresh(body):
+            return
         status = self.verify_sender(body)
+        if "d" in body:                                   # sinalizacao de call: nunca vira texto
+            if not crypto.Replay.on_time(body):
+                return
+            if status == "pending":
+                self.pending_verify.setdefault(body["n"], []).append((body, None, ch))
+            elif status in ("ok", "new"):
+                self.calls.on_room(ch, body)
+            return
         w = ch.view.add_message(body, body["n"] == self.ident.nick, status)
         if status == "pending":
-            self.pending_verify.setdefault(body["n"], []).append((body, w))
+            self.pending_verify.setdefault(body["n"], []).append((body, w, ch))
         self.bump(ch)
 
     # ------------------------------------------------------------ diretas
@@ -789,42 +923,60 @@ class MainWindow(QMainWindow):
     def open_dm(self, nick: str):
         if not nick or nick == self.ident.nick:
             return
-        cid = "dm:" + nick
-        ch = self.channels.get(cid)
+        if not valid_nick(nick):
+            return self.toast("nick invalido: confira (ex.: KuroiRonin-7F3A)")
+        ch = self.channels.get("dm:" + nick)
         if not ch:
-            ch = Channel("dm", nick, peer=nick)
-            self.channels[cid] = ch
-            self.stack.addWidget(ch.view)
-            ch.item = QListWidgetItem("@  " + nick)
-            ch.item.setData(Qt.UserRole, cid)
-            self.dm_list.addItem(ch.item)
+            ch = self.new_dm(nick)
             ch.view.add_system(f"conversa direta com {nick} · cifrada so para voces dois · nada fica salvo",
                                "#8c8c96")
             self.pending_dm[nick] = ch
             self.client.send({"op": "whois", "nick": nick})
         self.select_channel(ch)
 
+    def new_dm(self, nick: str, pk: str = "") -> Channel:
+        ch = Channel("dm", nick, peer=nick, peer_pk=pk)
+        self.channels[ch.cid] = ch
+        self.stack.addWidget(ch.view)
+        ch.item = QListWidgetItem("@  " + nick)
+        ch.item.setData(Qt.UserRole, ch.cid)
+        self.dm_list.addItem(ch.item)
+        return ch
+
     def on_dm(self, m: dict):
-        frm, pk = m.get("from", ""), m.get("from_pk", "")
+        frm, pk = m.get("from"), m.get("from_pk")
+        if not valid_nick(frm) or frm == self.ident.nick or not crypto.valid_pk(pk):
+            return
+        ch = self.channels.get("dm:" + frm)
+        try:
+            body = crypto.open_dm(self.ident.sk, pk, m.get("blob", ""))
+        except crypto.OldMessage:
+            return self.toast(f"{frm} usa uma versao antiga do HOLO: mensagem recusada (peca para atualizar)", "#ffb347")
+        if not body or body["n"] != frm:
+            # so quem ja conversa com voce gera aviso: lixo de estranhos nao abre conversa nem fixa chave
+            return ch.view.add_system("mensagem direta invalida descartada", "#ffb347") if ch else None
+        if not self.replay.fresh(body):
+            return
+        known = frm in self.store.data["pins"]
         pin = self.store.pin(frm, pk)
-        body = crypto.open_dm(self.ident.sk, pk, m["blob"])
-        cid = "dm:" + frm
-        if cid not in self.channels:
-            ch = Channel("dm", frm, peer=frm, peer_pk=pk)
-            self.channels[cid] = ch
-            self.stack.addWidget(ch.view)
-            ch.item = QListWidgetItem("@  " + frm)
-            ch.item.setData(Qt.UserRole, cid)
-            self.dm_list.addItem(ch.item)
+        is_call = "d" in body
+        if is_call and body["d"].get("a") != "invite":    # offer, answer, hangup...: so valem dentro de uma call
+            if pin != "changed" and crypto.Replay.on_time(body):
+                self.calls.on_dm(frm, pk, body, known)
+            return
+        if not ch:
+            ch = self.new_dm(frm, pk)
             ch.view.add_system(f"{frm} abriu uma conversa direta · chave {identity.fingerprint(crypto.ub64(pk))}",
                                "#8c8c96")
-        ch = self.channels[cid]
         ch.peer_pk = ch.peer_pk or pk
-        if not body or body.get("n") != frm:
-            return ch.view.add_system("mensagem direta invalida descartada", "#ffb347")
         if pin == "changed":
+            ch.changed_pk = pk
             ch.view.add_system(f"ATENCAO: a chave de {frm} mudou. Confirme com a pessoa por outro meio.", "#ffb347")
-        ch.view.add_message(body, False, "changed" if pin == "changed" else "ok")
+        if is_call:
+            if pin != "changed" and crypto.Replay.on_time(body):
+                self.calls.on_dm(frm, pk, body, known)
+        else:
+            ch.view.add_message(body, False, "changed" if pin == "changed" else "ok")
         self.bump(ch)
 
     # ------------------------------------------------------------ envio
@@ -844,11 +996,47 @@ class MainWindow(QMainWindow):
         else:
             if not ch.peer_pk:
                 return self.toast("ainda buscando a chave do destinatario...")
-            blob = crypto.seal_dm(self.ident.sk, self.ident.nick, ch.peer_pk, text, ttl, ch.peer)
+            if ch.changed_pk and not self.accept_key(ch):
+                return
+            blob = crypto.seal_dm(self.ident.sk, self.ident.nick, ch.peer_pk, text, ttl)
             self.client.send({"op": "dm", "to": ch.peer, "blob": blob})
             body = {"n": self.ident.nick, "k": self.ident.pk_b64, "t": text, "ts": int(time.time()), "ttl": ttl}
             ch.view.add_message(body, True, "ok")
         self.input.clear()
+
+    def accept_key(self, ch: Channel) -> bool:
+        """O contato aparece com outra chave: so passa a usar a nova se a pessoa confirmar."""
+        new = identity.fingerprint(crypto.ub64(ch.changed_pk))
+        r = QMessageBox.warning(self, "A chave do contato mudou",
+                                f"{ch.peer} aparece com uma chave diferente da que voce conhecia.\n\nChave nova: {new}\n\n"
+                                "Pode ser outra pessoa ou um servidor mal-intencionado. Confira a impressao digital por "
+                                "outro meio. Confiar na chave nova?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if r != QMessageBox.Yes:
+            return False
+        ch.peer_pk, ch.changed_pk = ch.changed_pk, ""
+        self.store.repin(ch.peer, ch.peer_pk)
+        self.refresh_members()
+        return True
+
+    def send_data(self, nick: str, pk: str, data: dict):
+        """Sinalizacao de call por mensagem direta cifrada."""
+        if self.client:
+            self.client.send({"op": "dm", "to": nick,
+                              "blob": crypto.seal_dm(self.ident.sk, self.ident.nick, pk, "", 0, data)})
+
+    def send_room_data(self, ch: Channel, data: dict):
+        if self.client:
+            self.client.send({"op": "msg", "room": ch.rid,
+                              "blob": crypto.seal_room(ch.key, self.ident.sk, self.ident.nick, "", 0, data)})
+
+    def update_call_button(self):
+        ch = self.current
+        self.call_btn.setVisible(bool(ch))
+        if not ch:
+            return
+        n = len(self.calls.rooms.get(ch.cid, ()))
+        self.call_btn.setText(f"CALL ({n})" if n else "CALL")
+        self.call_btn.setEnabled(not self.calls.busy())
 
     # ------------------------------------------------------------ navegacao
     def select_item(self, it: QListWidgetItem):
@@ -867,6 +1055,7 @@ class MainWindow(QMainWindow):
         (self.rooms_list if ch.kind == "room" else self.dm_list).setCurrentItem(ch.item)
         (self.dm_list if ch.kind == "room" else self.rooms_list).clearSelection()
         self.refresh_members()
+        self.update_call_button()
         self.input.setFocus()
 
     def bump(self, ch: Channel):
@@ -900,6 +1089,8 @@ class MainWindow(QMainWindow):
             it.setForeground(QColor(nick_color(ch.peer)))
             self.members.addItem(it)
             fp = identity.fingerprint(crypto.ub64(ch.peer_pk)) if ch.peer_pk else "buscando..."
+            if ch.changed_pk:
+                fp += "\n⚠ apareceu com outra chave: " + identity.fingerprint(crypto.ub64(ch.changed_pk))
             self.peer_info.setText(f"IMPRESSAO DIGITAL\n{fp}\n\nConfira com a pessoa por outro meio. Se mudar, "
                                    "o HOLO avisa.")
 
@@ -912,6 +1103,8 @@ class MainWindow(QMainWindow):
             self.store.data["remember_rooms"] = d.remember.isChecked()
             if not d.remember.isChecked():
                 self.store.data["rooms"] = []
+            self.store.data.update(mic=d.mic.currentData(), speaker=d.spk.currentData(),
+                                   accept_calls=d.accept_calls.currentData(), hide_ip=d.hide_ip.isChecked())
             self.store.save()
             if changed:
                 self.connect_server()
@@ -925,6 +1118,7 @@ class MainWindow(QMainWindow):
         import asyncio
         from . import server
         ready = threading.Event()
+        failed = []
 
         def run():
             self.host_loop = asyncio.new_event_loop()
@@ -934,10 +1128,13 @@ class MainWindow(QMainWindow):
                 self.host_loop.run_until_complete(server.serve("0.0.0.0", 7077, server.default_data_dir(),
                                                                quiet=True, stop=self.host_stop, ready=ready.set))
             except OSError as e:
+                failed.append(e)
                 self.bridge.event.emit({"op": "error", "code": "host", "msg": f"servidor local: {e}"})
                 ready.set()
         threading.Thread(target=run, daemon=True).start()
         ready.wait(5)
+        if failed or not ready.is_set():
+            return
         self.hosting = True
         if self.store.data["server"] != LOCAL_SERVER:
             self.store.data["server"] = LOCAL_SERVER
@@ -945,6 +1142,8 @@ class MainWindow(QMainWindow):
             self.connect_server()
 
     def panic(self):
+        self.calls.shutdown()
+        self.calls.forget_rooms()
         for ch in list(self.channels.values()):
             if ch.kind == "room" and self.client:
                 self.client.send({"op": "leave", "room": ch.rid})
@@ -952,6 +1151,12 @@ class MainWindow(QMainWindow):
             self.stack.removeWidget(ch.view)
             ch.view.deleteLater()
         self.channels.clear()
+        self.pending_verify.clear()
+        self.pending_dm.clear()
+        self.tasks = [t for t in self.tasks if t.isRunning()]      # guardavam o nome e a senha das salas
+        if self.store.data.get("rooms"):                           # senhas de 'Lembrar as salas'
+            self.store.data["rooms"] = []
+            self.store.save()
         self.rooms_list.clear()
         self.dm_list.clear()
         self.members.clear()
@@ -962,7 +1167,8 @@ class MainWindow(QMainWindow):
         self.lock.setText("")
         self.stack.setCurrentWidget(self.welcome)
         QApplication.clipboard().clear()
-        self.statusBar().showMessage("PANICO: tudo apagado da memoria e da tela", 4000)
+        self.update_call_button()
+        self.statusBar().showMessage("PANICO: saiu da call e das salas, e apagou conversas e senhas salvas", 4000)
 
     def backup_reminder(self):
         """Sem backup da chave, o nick se perde ao reinstalar: lembra (no maximo uma vez por semana)."""
@@ -985,6 +1191,7 @@ class MainWindow(QMainWindow):
             export_key(self, self)
 
     def closeEvent(self, e):
+        self.calls.shutdown()
         if self.client:
             self.client.stop()
         e.accept()
@@ -1003,7 +1210,12 @@ def main(argv=None):
     srv = next((a.split("=", 1)[1] for a in argv if a.startswith("--server=")), None)
     if srv:
         store.data["server"] = srv
-    ident = identity.load_identity()
+    try:
+        ident = identity.load_identity()
+    except OSError as e:
+        QMessageBox.critical(None, APP_NAME, f"Nao consegui ler a sua chave:\n{identity.Identity.key_path()}\n\n{e}\n\n"
+                             "Nada foi alterado. Confira a permissao do arquivo e abra de novo.")
+        return 1
     win = MainWindow(ident, store)
     # visual Cyberpunk (CRT, glitch, inicialização, barra de status); sem a tela de inicialização nas prévias
     fx.install(win, name="ARASAKA HOLO", icon=ASSETS / "arasaka-holo.svg", extra=lambda: [("NET", win.state_lbl.text())], boot=not any(a.startswith("--screenshot=") for a in argv))

@@ -1,0 +1,25 @@
+# ARASAKA HOLO // relay
+DirectoryIndex index.php
+Options -Indexes
+
+# nada alem do index.php precisa ser aberto pelo navegador
+<FilesMatch "^(holo-config.*\.php|.*\.(md|json|q))$">
+  <IfModule mod_authz_core.c>
+    Require all denied
+  </IfModule>
+  <IfModule !mod_authz_core.c>
+    Deny from all
+  </IfModule>
+</FilesMatch>
+
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  # dados (se a hospedagem nao deixar guardar fora da area publica)
+  RewriteRule ^holo-data - [F,L]
+  # paginas em http vao para https. O POST do app nao e redirecionado: o relay responde que precisa de https
+  RewriteCond %{HTTPS} !=on
+  RewriteCond %{HTTP:X-Forwarded-Proto} !=https
+  RewriteCond %{REQUEST_METHOD} =GET
+  RewriteCond %{HTTP_HOST} !^(localhost|127\.0\.0\.1)
+  RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]
+</IfModule>

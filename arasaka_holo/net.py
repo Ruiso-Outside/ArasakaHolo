@@ -42,6 +42,32 @@ class SessionLost(Exception):
     pass
 
 
+class OldServer(Exception):
+    """O relay nao prende a assinatura ao endereco (autenticacao v2)."""
+
+
+async def in_thread(fn, *a):
+    """Roda fn numa thread daemon. (O executor padrao do asyncio seguraria o fechamento do app ate o fim do poll.)"""
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+
+    def put(ok, v):
+        if not fut.done():
+            fut.set_result(v) if ok else fut.set_exception(v)
+
+    def run():
+        try:
+            r = (True, fn(*a))
+        except Exception as e:  # noqa: BLE001
+            r = (False, e)
+        try:
+            loop.call_soon_threadsafe(put, *r)
+        except RuntimeError:        # o loop ja fechou: ninguem espera mais a resposta
+            pass
+    threading.Thread(target=run, daemon=True, name="holo-post").start()
+    return await fut
+
+
 def _post(url: str, data: dict, timeout: float) -> dict:
     """POST JSON sincrono (roda numa thread). Sem cookies e com um user-agent fixo, sem dados do sistema."""
     import urllib.request
@@ -67,6 +93,8 @@ def friendly_error(e: Exception) -> str:
         return f"o servidor respondeu HTTP {code}"
     if name == "URLError":
         return friendly_error(getattr(e, "reason", e)) if not isinstance(getattr(e, "reason", None), str) else str(e.reason)[:160]
+    if name == "OldServer":
+        return "servidor desatualizado: envie o index.php novo (pasta relay-php) ou atualize o arasaka-holo-server"
     if name == "NotHttpRelay":
         return "esse endereco e um site, nao um servidor HOLO"
     if name == "InvalidURI":
@@ -101,6 +129,8 @@ class HoloClient:
         self.connected = False
         self.rooms: set[str] = set()      # salas para re-entrar apos reconectar
         self.thread: threading.Thread | None = None
+        self.unsent: list[dict] = []      # msg/dm que falharam no envio: vao de novo ao reconectar (quem recebe
+                                          # ignora repetidas pelo id)
 
     # ------------------------------------------------------------ thread
     def start(self):
@@ -159,60 +189,116 @@ class HoloClient:
             delay = min(delay * 2, 30)
         self.on_event({"op": "_state", "state": "stopped"})
 
-    # ------------------------------------------------------------ relay por HTTP (hospedagem PHP)
-    async def _run_http(self):
-        loop = asyncio.get_running_loop()
-        post = lambda data, timeout=15: loop.run_in_executor(None, _post, self.url, data, timeout)  # noqa: E731
-        hello = await post({"op": "hello"})
-        if hello.get("op") != "hello" or hello.get("transport") != "http":
-            raise NotHttpRelay()
-        ch = hello["challenge"]
-        nonce = await loop.run_in_executor(None, crypto.solve_pow, ch, self.ident.nick, self.ident.pk_b64,
-                                           int(hello.get("pow", 18)))
-        resp = await post({"op": "auth", "challenge": ch, "nick": self.ident.nick, "pk": self.ident.pk_b64,
-                           "sig": crypto.auth_signature(self.ident.sk, ch, self.ident.nick), "pow": nonce})
+    def _auth(self, hello: dict, nonce: int) -> dict:
+        ch = str(hello["challenge"])
+        return {"op": "auth", "v": crypto.AUTH, "nick": self.ident.nick, "pk": self.ident.pk_b64, "pow": nonce,
+                "sig": crypto.auth_signature(self.ident.sk, ch, self.ident.nick, crypto.url_host(self.url))}
+
+    async def _solve(self, hello: dict) -> int:
+        if hello.get("auth") != crypto.AUTH:
+            raise OldServer()
+        bits = int(hello.get("pow", 18))
+        if not 0 <= bits <= 24:            # um servidor nao pode travar o seu processador
+            raise ConnectionError("o servidor pediu uma prova de trabalho fora do normal")
+        return await in_thread(crypto.solve_pow, str(hello["challenge"]), self.ident.nick, self.ident.pk_b64, bits)
+
+    def _welcome(self, hello: dict, resp: dict) -> bool:
+        """True = entrou. False = recusado de vez (nao adianta tentar de novo)."""
         if resp.get("op") == "error":
             self.on_event(resp)
             if resp.get("code") in ("nick_taken", "bad_auth"):
                 self.stop_flag = True
-                return
+                return False
             raise ConnectionError(resp.get("msg"))
-        token = resp.pop("token")
+        if resp.get("op") != "welcome":
+            raise ConnectionError("resposta inesperada do servidor")
         self.connected = True
         resp["motd"] = hello.get("motd", "")
         self.on_event(resp)
         self.on_event({"op": "_state", "state": "online", "url": self.url})
-        for rid in list(self.rooms):
-            self.queue.put_nowait({"op": "join", "room": rid})
+        return True
+
+    def _resume(self) -> list[dict]:
+        """O que enviar logo apos conectar: entra nas salas de novo e reenvia o que falhou."""
+        out = [{"op": "join", "room": rid} for rid in list(self.rooms)] + self.unsent
+        self.unsent = []
+        return out
+
+    def _failed(self, msgs: list[dict]):
+        self.unsent = (self.unsent + [m for m in msgs if m.get("op") in ("msg", "dm")])[-20:]
+
+    # ------------------------------------------------------------ relay por HTTP (hospedagem PHP)
+    async def _run_http(self):
+        def post(data, timeout=15):
+            return in_thread(_post, self.url, data, timeout)
+
+        hello = await post({"op": "hello"})
+        if not isinstance(hello, dict):
+            raise NotHttpRelay()
+        if hello.get("op") == "error":
+            raise ConnectionError(hello.get("msg"))
+        if hello.get("op") != "hello" or hello.get("transport") != "http":
+            raise NotHttpRelay()
+        auth = self._auth(hello, await self._solve(hello))
+        resp = await post({**auth, "challenge": hello["challenge"]})
+        token = resp.pop("token", "")
+        if not self._welcome(hello, resp):
+            return
+        for m in self._resume():
+            self.queue.put_nowait(m)
 
         def dispatch(r):
             if r.get("op") == "error" and r.get("code") == "session":
                 raise SessionLost()
             for ev in r.get("events", []):
-                self.on_event(ev)
+                if isinstance(ev, dict):
+                    self.on_event(ev)
 
         async def poller():
+            fails = 0
             while True:
-                dispatch(await post({"op": "poll", "token": token}, timeout=40))
+                try:
+                    r = await post({"op": "poll", "token": token}, 40)
+                    fails = 0
+                except OSError:                        # uma falha isolada nao derruba a sessao
+                    fails += 1
+                    if fails >= 3:
+                        raise
+                    await asyncio.sleep(fails)
+                    continue
+                dispatch(r)
 
         async def writer():
             while True:
                 msg = await self.queue.get()
                 if msg.get("op") == "__stop__":
+                    try:
+                        await asyncio.wait_for(post({"op": "bye", "token": token}, 3), 2.5)   # some da sala na hora
+                    except Exception:  # noqa: BLE001
+                        pass
                     return
-                batch = [msg]
-                while not self.queue.empty() and len(batch) < 20:
+                batch, size = [msg], len(str(msg))
+                while not self.queue.empty() and len(batch) < 20 and size < 60000:
                     nxt = self.queue.get_nowait()
                     if nxt.get("op") == "__stop__":
                         self.queue.put_nowait(nxt)
                         break
                     batch.append(nxt)
-                dispatch(await post({"op": "send", "token": token, "msgs": batch}))
+                    size += len(str(nxt))
+                try:
+                    r = await post({"op": "send", "token": token, "msgs": batch})
+                    if r.get("code") == "session":
+                        self._failed(batch)
+                except Exception:
+                    self._failed(batch)
+                    raise
+                dispatch(r)
 
         tasks = [asyncio.create_task(poller()), asyncio.create_task(writer())]
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for t in pending:
             t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
         for t in done:
             if t.exception():
                 raise t.exception()
@@ -229,25 +315,12 @@ class HoloClient:
                 hello = json.loads(await asyncio.wait_for(ws.recv(), 15))
                 if hello.get("op") != "hello":
                     raise ConnectionError("servidor nao e um HOLO")
-                ch = hello["challenge"]
-                nonce = await asyncio.get_running_loop().run_in_executor(
-                    None, crypto.solve_pow, ch, self.ident.nick, self.ident.pk_b64, int(hello.get("pow", 18)))
-                await ws.send(json.dumps({"op": "auth", "nick": self.ident.nick, "pk": self.ident.pk_b64,
-                                          "sig": crypto.auth_signature(self.ident.sk, ch, self.ident.nick),
-                                          "pow": nonce}))
+                await ws.send(json.dumps(self._auth(hello, await self._solve(hello))))
                 resp = json.loads(await asyncio.wait_for(ws.recv(), 15))
-                if resp.get("op") == "error":
-                    self.on_event(resp)
-                    if resp.get("code") in ("nick_taken", "bad_auth"):
-                        self.stop_flag = True
-                        return
-                    raise ConnectionError(resp.get("msg"))
-                self.connected = True
-                resp["motd"] = hello.get("motd", "")
-                self.on_event(resp)
-                self.on_event({"op": "_state", "state": "online", "url": self.url})
-                for rid in list(self.rooms):
-                    await ws.send(json.dumps({"op": "join", "room": rid}))
+                if not self._welcome(hello, resp):
+                    return
+                for m in self._resume():
+                    self.queue.put_nowait(m)
                 await self._pump(ws)
         except Exception as e:  # noqa: BLE001
             if not self.stop_flag:
@@ -257,9 +330,11 @@ class HoloClient:
         async def reader():
             async for raw in ws:
                 try:
-                    self.on_event(json.loads(raw))
+                    m = json.loads(raw)
                 except ValueError:
-                    pass
+                    continue
+                if isinstance(m, dict):
+                    self.on_event(m)
 
         async def writer():
             while True:
@@ -267,7 +342,11 @@ class HoloClient:
                 if msg.get("op") == "__stop__":
                     await ws.close()
                     return
-                await ws.send(json.dumps(msg, separators=(",", ":")))
+                try:
+                    await ws.send(json.dumps(msg, separators=(",", ":")))
+                except Exception:
+                    self._failed([msg])
+                    raise
 
         async def pinger():
             while True:
@@ -278,6 +357,7 @@ class HoloClient:
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for t in pending:
             t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
         for t in done:
             if t.exception():
                 raise t.exception()

@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 *.tar.gz
 *.zip
+relay-php/holo-config.php
+relay-php/holo-data*/

@@ -39,6 +39,12 @@ if (-not (Test-Path $vpy)) { & $py -m venv (Join-Path $Data 'venv') }
 & $vpy -m pip install -q --upgrade "PySide6-Essentials>=6.5" "pynacl>=1.5" "websockets>=14"
 if ($LASTEXITCODE -ne 0) { throw "falha ao instalar as dependencias" }
 Ok "dependencias instaladas"
+# call e compartilhamento de tela: opcionais (o chat funciona sem elas)
+$ErrorActionPreference = 'Continue'
+& $vpy -m pip install -q --upgrade "aiortc>=1.10" "sounddevice>=0.4.6" "mss>=10" "numpy>=1.26"
+if ($LASTEXITCODE -eq 0) { Ok "call e compartilhamento de tela" }
+else { Write-Host "     !! calls desligadas: precisam do Python 3.10 ou mais novo (o chat funciona normal)" -ForegroundColor Yellow }
+$ErrorActionPreference = 'Stop'
 
 Step "Arquivos do app"
 $appDir = Join-Path $Data 'app'
