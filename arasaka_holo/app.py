@@ -31,7 +31,7 @@ from .identity import valid_nick
 from .net import HoloClient, normalize_url
 
 APP_NAME = "ARASAKA HOLO"
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 ASSETS = Path(__file__).resolve().parent / "assets"
 DEFAULT_SERVER = "https://piphin.online/"  # rede oficial (relay por HTTP no piphin.online)
 LOCAL_SERVER = "ws://127.0.0.1:7077"      # servidor rodando neste PC (CONFIG > INICIAR SERVIDOR)
@@ -51,6 +51,10 @@ QPlainTextEdit#composer:focus { border-color: #e3121f; }
 QFrame#msg_me { background: #160609; border-left: 3px solid #e3121f; }
 QFrame#msg_other { background: #0d0d10; border-left: 3px solid #2a2a31; }
 QFrame#msg_warn { background: #1d0a00; border-left: 3px solid #ffb347; }
+QSlider::groove:horizontal { height: 4px; background: #2a2a31; }
+QSlider::sub-page:horizontal { background: #e3121f; }
+QSlider::handle:horizontal { width: 10px; margin: -6px 0; background: #ececf0; border: 1px solid #e3121f; }
+QSlider::handle:horizontal:hover { background: #ff2436; }
 QFrame#errbar { background: #1d0a00; border-bottom: 1px solid #ffb347; }
 QFrame#callbar { background: #140407; border-bottom: 1px solid #5a080e; }
 QFrame#topbar { background: #050506; border-bottom: 1px solid #1a0507; }
@@ -125,7 +129,8 @@ class Store:
         self.dir = identity.config_dir()
         self.path = self.dir / "settings.json"
         self.data = {"server": DEFAULT_SERVER, "ttl": 0, "remember_rooms": False, "rooms": [], "pins": {},
-                     "accept_calls": "known", "hide_ip": False, "mic": "", "speaker": ""}
+                     "accept_calls": "known", "hide_ip": False, "mic": "", "speaker": "",
+                     "volumes": {}, "vol_master": 100, "vol_mic": 100}
         try:
             self.data.update(json.loads(self.path.read_text(encoding="utf-8")))
         except Exception:

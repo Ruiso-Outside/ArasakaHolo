@@ -149,6 +149,8 @@ class Mixer:
         self.buf: dict[str, deque] = {}
         self.size: dict[str, int] = {}
         self.ready: dict[str, bool] = {}
+        self.gain: dict[str, float] = {}       # volume de cada pessoa (1.0 = normal); so neste PC
+        self.master = 1.0
 
     def add(self, nick: str, pcm):
         with self.lock:
@@ -164,17 +166,18 @@ class Mixer:
                 d.pop(nick, None)
 
     def fill(self, n: int) -> bytes:
-        out = np.zeros(n, dtype=np.int32)
+        out = np.zeros(n, dtype=np.float32)
         with self.lock:
             for nick, q in self.buf.items():
                 if not self.ready.get(nick):
                     if self.size[nick] < SAMPLES * 3:      # 60 ms de folga antes de tocar (contra engasgos)
                         continue
                     self.ready[nick] = True
-                pos = 0
-                while pos < n and q:
+                pos, g = 0, self.gain.get(nick, 1.0)
+                while pos < n and q:                       # silenciado tambem anda, para nao acumular atraso
                     part = q[0][:n - pos]
-                    out[pos:pos + len(part)] += part
+                    if g:
+                        out[pos:pos + len(part)] += part * np.float32(g)
                     pos += len(part)
                     if len(part) == len(q[0]):
                         q.popleft()
@@ -183,7 +186,7 @@ class Mixer:
                 self.size[nick] -= pos
                 if pos < n:
                     self.ready[nick] = False               # esvaziou: junta folga de novo
-        return np.clip(out, -32768, 32767).astype(np.int16).tobytes()
+        return np.clip(out * np.float32(self.master), -32768, 32767).astype(np.int16).tobytes()
 
 
 class MicTrack(MediaStreamTrack):
@@ -206,8 +209,9 @@ class MicTrack(MediaStreamTrack):
             pcm = await asyncio.wait_for(self.q.get(), 1.0)
         except asyncio.TimeoutError:                       # sem microfone: silencio esparso mantem a call viva
             pcm = bytes(SAMPLES * 2)
-        f = av.AudioFrame(format="s16", layout="mono", samples=len(pcm) // 2)
-        f.planes[0].update(pcm)
+        # ja em estereo: o codificador converteria o mono com perda de 3 dB
+        f = av.AudioFrame(format="s16", layout="stereo", samples=len(pcm) // 2)
+        f.planes[0].update(np.repeat(np.frombuffer(pcm, dtype=np.int16), 2).tobytes())
         f.sample_rate, f.pts, f.time_base = RATE, self.pts, AUDIO_TB
         self.pts += f.samples
         return f
@@ -477,6 +481,7 @@ class CallEngine:
         self.mixer = Mixer()
         self.peers: dict[str, Peer] = {}
         self.muted = False
+        self.mic_gain = 1.0
         self.grabber: ScreenGrabber | None = None
         self.watching: set[str] = set()
         self.closed = False
@@ -531,6 +536,9 @@ class CallEngine:
 
     def _on_mic(self, pcm: bytes):
         data = bytes(len(pcm)) if self.muted else pcm
+        if self.mic_gain != 1.0 and not self.muted:
+            x = np.frombuffer(pcm, dtype=np.int16) * np.float32(self.mic_gain)
+            data = np.clip(x, -32768, 32767).astype(np.int16).tobytes()
         for p in self.peers.values():
             p.mic.push(data)
 
@@ -591,6 +599,13 @@ class CallEngine:
     def set_mute(self, on: bool):
         self.muted = on
         self._call(self._ctl_all)
+
+    def set_volume(self, nick: str, gain: float):
+        """Volume com que voce ouve a pessoa (0 = silenciada). Ela nao fica sabendo."""
+        self.mixer.gain[nick] = max(0.0, min(2.0, gain))
+
+    def set_levels(self, master: float, mic: float):
+        self.mixer.master, self.mic_gain = max(0.0, min(2.0, master)), max(0.0, min(2.0, mic))
 
     def start_screen(self, monitor: int, preset: str = "equilibrado", grabber=None):
         self.stop_screen()

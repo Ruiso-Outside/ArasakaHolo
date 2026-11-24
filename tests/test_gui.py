@@ -123,6 +123,24 @@ def main():
     b.calls.answer()
     until(lambda: a.calls.states.get(b.ident.nick) == b.calls.states.get(a.ident.nick) == "connected", "call conectada")
     until(lambda: a.calls.engine.audio.peak > 3000 and b.calls.engine.audio.peak > 3000, "audio")
+    a.calls.toggle_sound()
+    panel = a.calls.bar.panel
+    until(lambda: panel.isVisible() and b.ident.nick in panel.rows, "painel de som")
+    row = panel.rows[b.ident.nick]
+    row.slider.setValue(30)
+    until(lambda: 1500 < a.calls.engine.audio.peak < 3300, "volume 30%")
+    assert "[30%]" in a.calls.bar.people.text()
+    shot(a, "call-som")
+    row.mute.click()
+    until(lambda: a.calls.engine.audio.peak == 0 and "silenciado por voce" in a.calls.bar.people.text(), "silenciar")
+    pause(0.8)
+    assert holo.json.loads(a.store.path.read_text())["volumes"] == {b.ident.nick: {"v": 30, "m": True}}, "lembrado em disco"
+    row.mute.click()
+    until(lambda: a.calls.engine.audio.peak > 1000, "ouvir de novo")
+    panel.mic.slider.setValue(50)
+    until(lambda: 2500 < b.calls.engine.audio.peak < 5500, "microfone 50%")
+    panel.mic.value.click()
+    assert a.store.data["vol_mic"] == 100
     b.calls.toggle_mute()
     until(lambda: b.ident.nick in a.calls.muted, "mudo aparece")
     b.calls.engine.start_screen(1, "equilibrado", FakeScreen)
@@ -159,8 +177,19 @@ def main():
     a.calls.call()
     b.calls.call()
     until(lambda: a.calls.states.get(b.ident.nick) == b.calls.states.get(a.ident.nick) == "connected", "ligacoes cruzadas")
+    until(lambda: 1500 < a.calls.engine.audio.peak < 3300, "volume lembrado na call seguinte")
+    assert a.calls.bar.panel.isHidden(), "o painel comeca fechado"
+    a.calls.toggle_sound()
+    until(lambda: b.ident.nick in a.calls.bar.panel.rows, "linha do contato")
+    assert a.calls.bar.panel.rows[b.ident.nick].slider.value() == 30
+    a.calls.bar.panel.rows[b.ident.nick].value.click()
+    assert a.store.data["volumes"] == {}, "100% nao precisa ser guardado"
     b.calls.hangup()
     until(lambda: a.calls.phase == "idle", "fim")
+    for junk in (None, 5, [], {b.ident.nick: 3}, {b.ident.nick: {"v": "x", "m": 1}}):
+        a.store.data["volumes"] = junk              # settings.json estragado nao derruba a call
+        assert a.calls.volume(b.ident.nick) == (100, False)
+    a.store.data["volumes"] = {}
     b.store.data["accept_calls"] = "none"
     a.calls.call()
     pause(1)

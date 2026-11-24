@@ -115,6 +115,28 @@ def main():
     assert abs(a.audio.tone() - 880) < 8 and abs(b.audio.tone() - 440) < 8, (a.audio.tone(), b.audio.tone())
     print("  audio nos dois sentidos, sem distorcer o tom")
 
+    # volume por pessoa, geral e do microfone
+    def vol(eng, lo, hi, what):
+        until(lambda: lo < eng.audio.peak < hi, what)
+    a.set_volume("B", 0.25)
+    vol(a, 1300, 2700, "25%")
+    a.set_volume("B", 0.0)
+    until(lambda: a.audio.peak == 0, "silenciado por mim")
+    assert b.audio.peak > 5000, "silenciar alguem nao afeta o que ele ouve"
+    a.set_volume("B", 2.0)
+    vol(a, 13000, 17500, "200%")
+    a.set_levels(0.5, 1.0)
+    vol(a, 6000, 9000, "volume geral 50%")
+    a.set_levels(1.0, 0.5)
+    vol(b, 2900, 5000, "microfone 50%")
+    a.set_levels(9.0, 9.0)
+    assert a.mixer.master == a.mic_gain == 2.0, "limite de 200%"
+    a.set_levels(1.0, 1.0)
+    a.set_volume("B", 1.0)
+    vol(a, 6500, 9000, "normal")
+    assert sum(a.mixer.size.values()) <= calls.Mixer.MAX
+    print("  volume por pessoa, geral e do microfone")
+
     a.set_mute(True)
     until(lambda: any(e["op"] == "call_mute" and e["on"] for e in net.ev["B"]), "aviso de mudo")
     until(lambda: b.audio.peak < 100, "mudo silencia")

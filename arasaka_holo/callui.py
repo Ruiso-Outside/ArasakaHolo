@@ -15,8 +15,8 @@ import time
 
 from PySide6.QtCore import QObject, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QImage, QPainter
-from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QLabel,
-                               QMessageBox, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QLabel,
+                               QMessageBox, QPushButton, QSlider, QVBoxLayout, QWidget)
 
 from . import calls
 from .kit import BaseDialog, button, label
@@ -100,6 +100,94 @@ class ShareDialog(BaseDialog):
         self.add_buttons("COMPARTILHAR")
 
 
+def percent(v, default=100) -> int:
+    """Volume salvo em disco: aceita so numeros, de 0 a 200."""
+    return max(0, min(200, v)) if type(v) is int else default
+
+
+class VolumeRow:
+    """Uma linha do painel SOM: nome, controle de 0 a 200%, valor e silenciar."""
+
+    def __init__(self, grid: QGridLayout, row: int, name: str, on_change, mute: bool = True):
+        self.name = label(name, None, 0.5, 13, True)
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(0, 200)
+        self.slider.setPageStep(10)
+        self.value = QPushButton("100%")
+        self.value.setProperty("kind", "ghost")
+        self.value.setFixedWidth(72)
+        self.value.setToolTip("Voltar para 100%")
+        self.mute = button("SILENCIAR", None, self._toggle) if mute else None
+        self.on_change = on_change
+        self.silent = False
+        self.value.clicked.connect(lambda _c=False: self.slider.setValue(100))
+        self.slider.valueChanged.connect(lambda _v: self._changed())
+        for col, w in enumerate((self.name, self.slider, self.value, self.mute)):
+            if w:
+                grid.addWidget(w, row, col)
+
+    def set(self, v: int, silent: bool = False):
+        self.slider.blockSignals(True)
+        self.slider.setValue(v)
+        self.slider.blockSignals(False)
+        self.silent = silent
+        self._paint()
+
+    def _toggle(self):
+        self.silent = not self.silent
+        self._paint()
+        self.on_change(self.slider.value(), self.silent)
+
+    def _changed(self):
+        self.silent = False                      # mexeu no volume: quer ouvir
+        self._paint()
+        self.on_change(self.slider.value(), self.silent)
+
+    def _paint(self):
+        self.value.setText(f"{self.slider.value()}%")
+        if self.mute:
+            self.mute.setText("OUVIR" if self.silent else "SILENCIAR")
+        self.name.setStyleSheet("color: #55555e;" if self.silent else "color: #ececf0;")
+
+    def remove(self, grid: QGridLayout):
+        for w in (self.name, self.slider, self.value, self.mute):
+            if w:
+                grid.removeWidget(w)
+                w.deleteLater()
+
+
+class SoundPanel(QFrame):
+    """Volumes da call. Valem so neste PC (menos o do microfone, que muda o que os outros ouvem)."""
+
+    def __init__(self, mgr: "CallManager"):
+        super().__init__()
+        self.mgr = mgr
+        self.grid = QGridLayout(self)
+        self.grid.setContentsMargins(0, 6, 0, 4)
+        self.grid.setHorizontalSpacing(14)
+        self.grid.setVerticalSpacing(6)
+        self.grid.setColumnStretch(1, 1)
+        self.rows: dict[str, VolumeRow] = {}
+        self.next = 2
+        self.master = VolumeRow(self.grid, 0, "VOLUME GERAL", lambda v, _s: mgr.set_level("vol_master", v), mute=False)
+        self.mic = VolumeRow(self.grid, 1, "SEU MICROFONE", lambda v, _s: mgr.set_level("vol_mic", v), mute=False)
+        self.hide()
+
+    def sync(self, nicks: list[str]):
+        for n in [n for n in self.rows if n not in nicks]:
+            self.rows.pop(n).remove(self.grid)
+        for n in nicks:
+            if n not in self.rows:
+                r = self.rows[n] = VolumeRow(self.grid, self.next, n, lambda v, s, n=n: self.mgr.set_volume(n, v, s))
+                self.next += 1
+                r.set(*self.mgr.volume(n))
+
+    def load(self):
+        d = self.mgr.win.store.data
+        self.master.set(percent(d.get("vol_master")))
+        self.mic.set(percent(d.get("vol_mic")))
+
+
 class CallBar(QFrame):
     def __init__(self, mgr: "CallManager"):
         super().__init__()
@@ -113,19 +201,24 @@ class CallBar(QFrame):
         self.people = QLabel("")
         self.people.setTextFormat(Qt.RichText)
         self.people.setWordWrap(True)
+        self.people.linkActivated.connect(lambda _n: mgr.toggle_sound(True))
+        self.people.setToolTip("Clique num nick para ajustar o volume")
         row.addWidget(self.people, 1)
         self.answer = button("ATENDER", "primary", mgr.answer)
         self.decline = button("RECUSAR", "danger", mgr.decline)
         self.mute = button("MUDO", None, mgr.toggle_mute, "Liga e desliga o microfone (Ctrl+M)")
         self.share = button("TELA", None, mgr.toggle_share, "Compartilha a sua tela")
+        self.sound = button("SOM", None, mgr.toggle_sound, "Volume de cada pessoa, geral e do seu microfone")
         self.hang = button("SAIR", "danger", mgr.hangup, "Sai da call")
-        for b in (self.answer, self.decline, self.mute, self.share, self.hang):
+        for b in (self.answer, self.decline, self.mute, self.sound, self.share, self.hang):
             row.addWidget(b)
         lay.addLayout(row)
         self.views = QHBoxLayout()
         self.views.addStretch()
         lay.addLayout(self.views)
         self.view_btns: dict[str, object] = {}
+        self.panel = SoundPanel(mgr)
+        lay.addWidget(self.panel)
         self.hide()
 
     def set_views(self, nicks: list[str], slot):
@@ -165,6 +258,9 @@ class CallManager(QObject):
         self.rooms: dict[str, set[str]] = {}    # cid -> quem esta na call da sala (para o botao)
         self.audio_factory = None            # testes
         self.bar = CallBar(self)
+        self.save_timer = QTimer(self)       # arrastar o volume nao grava o disco a cada passo
+        self.save_timer.setSingleShot(True)
+        self.save_timer.timeout.connect(self.win.store.save)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.ice_timer = QTimer(self)        # a credencial TURN expira: renova de hora em hora
@@ -223,7 +319,9 @@ class CallManager(QObject):
                                                                                   d.get("speaker", ""))
         self.engine = calls.CallEngine(self.call_id, self.win.bridge.event.emit, self.win.ice,
                                        bool(d.get("hide_ip")), audio)
+        self.engine.set_levels(percent(d.get("vol_master")) / 100, percent(d.get("vol_mic")) / 100)
         self.engine.start()
+        self.bar.panel.load()
         self.phase, self.since = "on", time.time()
         self.timer.start(300)
 
@@ -428,6 +526,42 @@ class CallManager(QObject):
             s.discard(nick)
         self._close_window(nick)
 
+    # ------------------------------------------------------------ som
+    def volume(self, nick: str) -> tuple[int, bool]:
+        """(0 a 200, silenciado) que voce escolheu para a pessoa."""
+        vols = self.win.store.data.get("volumes")
+        v = vols.get(nick) if isinstance(vols, dict) else None
+        return (percent(v.get("v")), v.get("m") is True) if isinstance(v, dict) else (100, False)
+
+    def set_volume(self, nick: str, v: int, silent: bool):
+        d = self.win.store.data
+        if not isinstance(d.get("volumes"), dict):
+            d["volumes"] = {}
+        if v == 100 and not silent:
+            d["volumes"].pop(nick, None)
+        else:
+            d["volumes"][nick] = {"v": v, "m": silent}
+        self._apply_volume(nick)
+        self.save_timer.start(600)
+        self.refresh()
+
+    def _apply_volume(self, nick: str):
+        if self.engine:
+            v, silent = self.volume(nick)
+            self.engine.set_volume(nick, 0.0 if silent else v / 100)
+
+    def set_level(self, key: str, v: int):
+        d = self.win.store.data
+        d[key] = v
+        if self.engine:
+            self.engine.set_levels(percent(d.get("vol_master")) / 100, percent(d.get("vol_mic")) / 100)
+        self.save_timer.start(600)
+
+    def toggle_sound(self, show: bool | None = None):
+        p = self.bar.panel
+        p.setVisible(p.isHidden() if show is None else show)
+        self.refresh()
+
     # ------------------------------------------------------------ controles
     def toggle_mute(self):
         if self.engine:
@@ -527,12 +661,17 @@ class CallManager(QObject):
         self.win.update_call_button()
         b.setVisible(self.phase != "idle")
         if self.phase == "idle":
+            b.panel.hide()
+            b.panel.sync([])
             return b.set_views([], self.view)
         on = self.phase == "on"
         b.answer.setVisible(self.phase == "in")
         b.decline.setVisible(self.phase == "in")
         b.mute.setVisible(on)
         b.share.setVisible(on)
+        b.sound.setVisible(on)
+        if not on:
+            b.panel.hide()
         b.hang.setVisible(self.phase != "in")
         ch = self._ch()
         where = ("#" + ch.title) if ch and self.kind == "room" else ""
@@ -544,13 +683,21 @@ class CallManager(QObject):
         else:
             b.status.setText("■ CHAMANDO" if self.phase == "out" else "■ CALL RECEBIDA")
         names = sorted(set(self.trusted) | set(self.states))
+        b.sound.setText("FECHAR SOM" if not b.panel.isHidden() else "SOM")
+        if on:
+            b.panel.sync(names)
+            for n in names:
+                self._apply_volume(n)
         parts = []
         for n in names:
             st = self.states.get(n, "")
             speaking = self.levels.get(n, 0) > 0.012
             color = "#ff2e40" if speaking else "#ececf0" if st == "connected" else "#55555e"
             extra = " (mudo)" if n in self.muted else "" if st == "connected" or not on else " (conectando)"
-            parts.append(f'<span style="color:{color}">{"◉" if speaking else "●"} {n}{extra}</span>')
+            vol, silent = self.volume(n)
+            extra += " [silenciado por voce]" if silent else f" [{vol}%]" if vol != 100 else ""
+            text = f'<span style="color:{color}">{"◉" if speaking else "●"} {n}{extra}</span>'
+            parts.append(f'<a href="{n}" style="text-decoration:none">{text}</a>' if on else text)
         if on and self.engine.muted:
             parts.append('<span style="color:#ffb347">seu microfone esta mudo</span>')
         if on and self.engine.grabber:
